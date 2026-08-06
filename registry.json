@@ -1,0 +1,35 @@
+{
+  "schema": 1,
+  "id": "gaminghubproject-official",
+  "name": "GamingHubProject Official Registry",
+  "homepage": "https://github.com/GamingHubProject",
+  "extensions": [
+    {
+      "id": "gaming-hub-core",
+      "name": "Gaming Hub Core",
+      "description": "Gaming Hub Core",
+      "author": "GamingHubProject",
+      "category": "Core",
+      "repository": "https://github.com/GamingHubProject/Core",
+      "release_asset": "gaming-hub-core-v*.zip",
+      "checksum_asset": "SHA256SUMS",
+      "verified": true,
+      "official": true
+    },
+    {
+      "id": "gaming-hub-panel",
+      "name": "Gaming Hub Panel",
+      "description": "Pelican / Pterodactyl integration",
+      "author": "GamingHubProject",
+      "category": "Integrations",
+      "repository": "https://github.com/GamingHubProject/Panel",
+      "release_asset": "gaming-hub-panel-v*.zip",
+      "checksum_asset": "SHA256SUMS",
+      "verified": true,
+      "official": true,
+      "requires": {
+        "gaming-hub-core": ">=0.7.0"
+      }
+    }
+  ]
+}
