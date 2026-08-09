@@ -5,6 +5,18 @@
   "homepage": "https://github.com/GamingHubProject",
   "extensions": [
     {
+      "id": "gaming-hub-manager",
+      "name": "Gaming Hub Manager",
+      "description": "Gaming Hub package lifecycle manager",
+      "author": "GamingHubProject",
+      "category": "System",
+      "repository": "https://github.com/GamingHubProject/Manager",
+      "release_asset": "gaming-hub-manager-v*.zip",
+      "checksum_asset": "SHA256SUMS",
+      "verified": true,
+      "official": true
+    },
+    {
       "id": "gaming-hub-core",
       "name": "Gaming Hub Core",
       "description": "Gaming Hub Core",
