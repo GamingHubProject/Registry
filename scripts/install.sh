@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-INSTALLER_VERSION="2.9.3-write-probe-fix"
+INSTALLER_VERSION="2.9.4-env-acl-fix"
 AZURIOM_VERSION="1.2.12"
 INSTALL_DIR="/opt/azuriom"
 AZURIOM_URL="https://github.com/Azuriom/Azuriom/releases/download/v${AZURIOM_VERSION}/Azuriom-${AZURIOM_VERSION}.zip"
@@ -87,6 +87,29 @@ set_env_value() {
     fi
 
     mv "$temporary" "$file"
+}
+
+# chmod on a file that already carries a POSIX ACL rewrites the ACL's mask
+# from the "group" bits given to chmod: `chmod 600` sets the mask to `---`,
+# which caps every named ACL entry's EFFECTIVE permission to nothing even
+# though the entry itself is untouched. set_env_value's mktemp+mv can also
+# drop or preserve the ACL depending on whether $TMPDIR and the destination
+# share a filesystem. Since .env is rewritten many times after WWW_UID's ACL
+# grant, always route "chmod 600 .env" through this so PHP-FPM's read access
+# to it is restored (and the mask fixed) every single time.
+secure_env_file() {
+    local file="${1:-.env}"
+    chmod 600 "$file"
+
+    local www_uid="${WWW_UID:-}"
+    if [[ -z "$www_uid" ]] && find_docker_command 2>/dev/null; then
+        www_uid="$(
+            "${DOCKER[@]}" compose exec -T app id -u www-data 2>/dev/null \
+                | tail -n 1 \
+                | tr -d '[:space:]'
+        )"
+    fi
+    [[ "$www_uid" =~ ^[0-9]+$ ]] && "${SUDO[@]}" setfacl -m "u:${www_uid}:rw" "$file"
 }
 
 
@@ -667,7 +690,7 @@ COMPOSE
 
     set_env_value .env APP_URL "https://${domain}"
     set_env_value .env COMPOSE_FILE "docker-compose.yml:${PROXY_COMPOSE_FILE}"
-    chmod 600 .env
+    secure_env_file .env
 
     cat > "$DOMAIN_CONFIG_FILE" <<DOMAINCONF
 DOMAIN=${domain}
@@ -828,10 +851,10 @@ azuriom_custom_game_setup() {
     set_env_value .env APP_URL "$app_url"
     set_env_value .env MAIL_MAILER "array"
     set_env_value .env AZURIOM_GAME "custom"
-    chmod 600 .env
+    secure_env_file .env
 
     "${DOCKER[@]}" compose exec -T app php artisan key:generate --force >/dev/null
-    chmod 600 .env
+    secure_env_file .env
 
     local app_key
     app_key="$(awk -F= '$1 == "APP_KEY" { sub(/^APP_KEY=/, ""); print; exit }' .env)"
@@ -1465,7 +1488,7 @@ out.append(f"APP_PORT={os.environ['APP_PORT']}")
 env_path.write_text("\n".join(out) + "\n")
 PY
 
-chmod 600 .env
+secure_env_file .env
 
 for required in '${APP_PORT}' '${DB_DATABASE}' '${DB_USERNAME}' '${DB_PASSWORD}'; do
     grep -qF "$required" docker-compose.yml || fail "Compose configuration patch failed for ${required}."
