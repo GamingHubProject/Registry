@@ -1375,6 +1375,15 @@ cd "$INSTALL_DIR"
 cp docker-compose.yml docker-compose.yml.upstream
 cp .env.example .env
 
+# docker-compose.yml bind-mounts the whole install directory over the image's
+# copy at runtime, so nothing under storage/ needs to be in the build context.
+# Excluding it also avoids a build failure later: manager_write_provenance
+# creates storage/app/gaming-hub-manager as root, mode 0700, which the
+# non-root user running `docker compose build` cannot stat into otherwise.
+if [[ ! -f .dockerignore ]] || ! grep -qxF 'storage/' .dockerignore; then
+    printf 'storage/\n' >> .dockerignore
+fi
+
 info "Official Azuriom files installed in ${INSTALL_DIR}."
 
 # -----------------------------------------------------------------------------
