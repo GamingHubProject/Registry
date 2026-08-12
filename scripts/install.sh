@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-INSTALLER_VERSION="2.9.5-prompted-flow"
+INSTALLER_VERSION="2.9.6-secure-env-setpipe-fix"
 AZURIOM_VERSION="1.2.12"
 INSTALL_DIR="/opt/azuriom"
 AZURIOM_URL="https://github.com/Azuriom/Azuriom/releases/download/v${AZURIOM_VERSION}/Azuriom-${AZURIOM_VERSION}.zip"
@@ -109,7 +109,10 @@ secure_env_file() {
                 | tr -d '[:space:]'
         )"
     fi
-    [[ "$www_uid" =~ ^[0-9]+$ ]] && "${SUDO[@]}" setfacl -m "u:${www_uid}:rw" "$file"
+    if [[ "$www_uid" =~ ^[0-9]+$ ]]; then
+        "${SUDO[@]}" setfacl -m "u:${www_uid}:rw" "$file"
+    fi
+    return 0
 }
 
 
