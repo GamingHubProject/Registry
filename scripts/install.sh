@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-INSTALLER_VERSION="2.9.6-secure-env-setpipe-fix"
+INSTALLER_VERSION="2.9.7-pipefail-uid-lookups-fix"
 AZURIOM_VERSION="1.2.12"
 INSTALL_DIR="/opt/azuriom"
 AZURIOM_URL="https://github.com/Azuriom/Azuriom/releases/download/v${AZURIOM_VERSION}/Azuriom-${AZURIOM_VERSION}.zip"
@@ -107,7 +107,7 @@ secure_env_file() {
             "${DOCKER[@]}" compose exec -T app id -u www-data 2>/dev/null \
                 | tail -n 1 \
                 | tr -d '[:space:]'
-        )"
+        )" || true
     fi
     if [[ "$www_uid" =~ ^[0-9]+$ ]]; then
         "${SUDO[@]}" setfacl -m "u:${www_uid}:rw" "$file"
@@ -1047,7 +1047,7 @@ PY_ENABLED
     "${SUDO[@]}" rm -rf "$stage_dir"
     "${SUDO[@]}" cp -a "$new_plugin_dir" "$stage_dir" || { "${SUDO[@]}" rm -rf "$stage_dir"; rm -rf "$upgrade_tmp"; fail "Manager staging failed before replacement."; }
     local www_uid
-    www_uid="$("${DOCKER[@]}" compose exec -T app sh -c 'id -u www-data' 2>/dev/null | tail -n1 | tr -d '[:space:]')"
+    www_uid="$("${DOCKER[@]}" compose exec -T app sh -c 'id -u www-data' 2>/dev/null | tail -n1 | tr -d '[:space:]')" || true
     if [[ "$www_uid" =~ ^[0-9]+$ ]] && command_exists setfacl; then "${SUDO[@]}" setfacl -R -m "u:${www_uid}:rwX" "$stage_dir" || fail "Could not apply PHP ACL to staged Manager."; fi
 
     [[ "$enabled_before" == "yes" ]] && "${DOCKER[@]}" compose exec -T app php artisan plugin:disable gaming-hub-manager
@@ -1563,7 +1563,7 @@ WWW_UID="$(
     "${DOCKER[@]}" compose run --rm --no-deps --entrypoint sh app -c 'id -u www-data' 2>/dev/null \
         | tail -n 1 \
         | tr -d '[:space:]'
-)"
+)" || true
 
 [[ "$WWW_UID" =~ ^[0-9]+$ ]] || fail "Could not determine the container www-data UID."
 
@@ -1576,7 +1576,7 @@ NGINX_WORKER_UID="$(
     "${DOCKER[@]}" compose run --rm --no-deps --entrypoint sh nginx -c 'id -u nginx' 2>/dev/null \
         | tail -n 1 \
         | tr -d '[:space:]'
-)"
+)" || true
 [[ "$NGINX_WORKER_UID" =~ ^[0-9]+$ ]] || fail "Could not determine the Nginx worker UID."
 
 "${SUDO[@]}" setfacl -R -m "u:${WWW_UID}:rwX" "$INSTALL_DIR"
