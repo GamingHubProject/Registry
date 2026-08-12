@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-INSTALLER_VERSION="2.9.4-env-acl-fix"
+INSTALLER_VERSION="2.9.5-prompted-flow"
 AZURIOM_VERSION="1.2.12"
 INSTALL_DIR="/opt/azuriom"
 AZURIOM_URL="https://github.com/Azuriom/Azuriom/releases/download/v${AZURIOM_VERSION}/Azuriom-${AZURIOM_VERSION}.zip"
@@ -1143,7 +1143,8 @@ select_action() {
     printf '  4) Create first/admin login\n'
     printf '  5) Upgrade Gaming Hub Manager\n'
     printf '  6) Uninstall completely (deletes existing data)\n'
-    printf '  7) Exit\n\n'
+    printf '  7) Exit\n'
+    printf '  8) Enable Gaming Hub Manager\n\n'
 
     local choice
     read -r -p "Selection [1]: " choice
@@ -1157,6 +1158,7 @@ select_action() {
         5) ACTION="upgrade_manager" ;;
         6) ACTION="uninstall" ;;
         7) ACTION="exit" ;;
+        8) ACTION="enable_manager" ;;
         *) fail "Invalid selection. Run the installer again." ;;
     esac
 }
@@ -1183,6 +1185,12 @@ fi
 if [[ "$ACTION" == "upgrade_manager" ]]; then
     azuriom_resources_exist || fail "No existing Azuriom installation was found. Install Azuriom first."
     upgrade_manager
+    exit 0
+fi
+
+if [[ "$ACTION" == "enable_manager" ]]; then
+    azuriom_resources_exist || fail "No existing Azuriom installation was found. Install Azuriom first."
+    enable_gaming_hub_manager
     exit 0
 fi
 
@@ -1695,11 +1703,34 @@ info "Containers restarted and Nginx/PHP permissions verified."
 step "Finishing Azuriom setup"
 
 printf '\nThe Docker installation is ready.\n'
-printf 'Azuriom is now being initialized automatically as Gaming Hub Custom Game\n'
-printf '(this replaces visiting http://SERVER-IP:%s/, clicking Continue on the\n' "$APP_PORT"
-printf 'Azuriom install page, and opening /install/game/custom by hand).\n'
+printf 'For Gaming Hub, Azuriom can now be initialized automatically as Custom Game\n'
+printf 'and Gaming Hub Manager enabled (this replaces visiting http://SERVER-IP:%s/,\n' "$APP_PORT"
+printf 'clicking Continue on the Azuriom install page, and opening\n'
+printf '/install/game/custom by hand).\n\n'
 
-azuriom_custom_game_setup
+read -r -p "Automatically set up Gaming Hub Custom Game and enable Gaming Hub Manager now? [Y/n]: " AUTO_GAMING_HUB_SETUP
+AUTO_GAMING_HUB_SETUP="${AUTO_GAMING_HUB_SETUP:-Y}"
+
+if [[ "$AUTO_GAMING_HUB_SETUP" =~ ^[Yy]$ ]]; then
+    azuriom_custom_game_setup
+    enable_gaming_hub_manager
+else
+    printf '\nAutomatic Gaming Hub setup skipped.\n\n'
+    printf 'Open Azuriom in your browser:\n'
+    printf '  http://SERVER-IP:%s\n\n' "$APP_PORT"
+    printf 'Use these values in the Azuriom browser installer:\n'
+    printf '  Driver:   PostgreSQL\n'
+    printf '  Host:     db\n'
+    printf '  Port:     5432\n'
+    printf '  Database: %s\n' "$DB_DATABASE"
+    printf '  Username: %s\n' "$DB_USERNAME"
+    printf '  Password: %s\n\n' "$DB_PASSWORD"
+    printf 'For Gaming Hub / Custom Game, after the database page open:\n'
+    printf '  http://SERVER-IP:%s/install/game/custom\n\n' "$APP_PORT"
+    printf 'Once Azuriom is set up, run this installer again and choose menu option 8\n'
+    printf 'to enable Gaming Hub Manager, and menu option 4 to create the first\n'
+    printf 'administrator login.\n\n'
+fi
 
 printf '\nCredentials are stored at:\n'
 printf '  %s\n\n' "$CREDENTIAL_FILE"
@@ -1717,8 +1748,5 @@ else
     printf 'and selecting menu option 3.\n'
 fi
 
-# Asked regardless of the reverse-proxy answer above.
+# Asked after everything else finishes, regardless of the answers above.
 create_admin_login
-
-# Asked regardless of the admin-account answer above.
-enable_gaming_hub_manager
