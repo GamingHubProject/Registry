@@ -30,6 +30,54 @@
       "requires": {
         "gaming-hub-core": "*"
       }
+    },
+    {
+      "id": "pelican",
+      "name": "Gaming Hub Pelican Connector",
+      "description": "Read-only Pelican Panel server-status and metrics Connector for Gaming Hub Panel",
+      "author": "GamingHubProject",
+      "category": "Connectors",
+      "repository": "https://github.com/GamingHubProject/Panel-Connectors",
+      "release_asset": "pelican-v*.zip",
+      "checksum_asset": "SHA256SUMS",
+      "verified": true,
+      "official": true,
+      "requires": {
+        "gaming-hub-core": "*",
+        "gaming-hub-panel": "*"
+      }
+    },
+    {
+      "id": "pterodactyl",
+      "name": "Gaming Hub Pterodactyl Connector",
+      "description": "Pterodactyl server-management-panel Connector for Gaming Hub Panel (placeholder — not yet implemented, see roadmap phase P4)",
+      "author": "GamingHubProject",
+      "category": "Connectors",
+      "repository": "https://github.com/GamingHubProject/Panel-Connectors",
+      "release_asset": "pterodactyl-v*.zip",
+      "checksum_asset": "SHA256SUMS",
+      "verified": false,
+      "official": true,
+      "requires": {
+        "gaming-hub-core": "*",
+        "gaming-hub-panel": "*"
+      }
+    },
+    {
+      "id": "amp",
+      "name": "Gaming Hub AMP Connector",
+      "description": "AMP server-management-panel Connector for Gaming Hub Panel (placeholder — not yet implemented, see roadmap phase P5)",
+      "author": "GamingHubProject",
+      "category": "Connectors",
+      "repository": "https://github.com/GamingHubProject/Panel-Connectors",
+      "release_asset": "amp-v*.zip",
+      "checksum_asset": "SHA256SUMS",
+      "verified": false,
+      "official": true,
+      "requires": {
+        "gaming-hub-core": "*",
+        "gaming-hub-panel": "*"
+      }
     }
   ]
 }
