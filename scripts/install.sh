@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-INSTALLER_VERSION="2.9.2-manager-self-verification"
+INSTALLER_VERSION="2.9.3-write-probe-fix"
 AZURIOM_VERSION="1.2.12"
 INSTALL_DIR="/opt/azuriom"
 AZURIOM_URL="https://github.com/Azuriom/Azuriom/releases/download/v${AZURIOM_VERSION}/Azuriom-${AZURIOM_VERSION}.zip"
