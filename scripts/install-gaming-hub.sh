@@ -27,7 +27,7 @@ CADDY_CONFIG_DIR="docker/caddy"
 DOMAIN_CONFIG_FILE=".gaming-hub-domain"
 
 STEP=0
-TOTAL_STEPS=8
+TOTAL_STEPS=9
 
 step() {
     STEP=$((STEP + 1))
@@ -118,6 +118,46 @@ find_docker_command() {
     return 1
 }
 
+uninstall_gaming_hub() {
+    local dir remove_data remove_files confirmation
+    dir="$(ask_default "Install directory to uninstall" "$DEFAULT_INSTALL_DIR")"
+
+    if [[ ! -f "${dir}/${COMPOSE_BASE}" ]]; then
+        fail "No Gaming Hub installation found at ${dir} (no ${COMPOSE_BASE} there)."
+    fi
+
+    printf '\n\033[1;31mThis stops and removes the Gaming Hub containers at %s.\033[0m\n' "$dir"
+
+    remove_data="no"
+    ask_yes_no "Also delete the PostgreSQL data volume? This PERMANENTLY destroys the database." "n" \
+        && remove_data="yes"
+
+    remove_files="no"
+    ask_yes_no "Also delete the install directory itself (${dir}), including .env and secrets?" "n" \
+        && remove_files="yes"
+
+    printf '\nThis cannot be undone. Type UNINSTALL to confirm, anything else to cancel: '
+    read -r confirmation
+    [[ "$confirmation" == "UNINSTALL" ]] || fail "Uninstall cancelled — nothing was changed."
+
+    cd "$dir"
+    if [[ "$remove_data" == "yes" ]]; then
+        "${DOCKER[@]}" compose --env-file .env down -v < /dev/null
+    else
+        "${DOCKER[@]}" compose --env-file .env down < /dev/null
+        info "Containers removed. The PostgreSQL data volume was kept — reinstalling into the same directory will reuse it."
+    fi
+
+    if [[ "$remove_files" == "yes" ]]; then
+        cd /
+        "${SUDO[@]}" rm -rf "$dir"
+        info "Removed ${dir}."
+    fi
+
+    printf '\n\033[1;32mGaming Hub has been uninstalled.\033[0m\n'
+    exit 0
+}
+
 printf '\033[1;35mGaming Hub Platform Installer v%s\033[0m\n' "$INSTALLER_VERSION"
 printf '%s\n' "$REPO_URL"
 
@@ -168,6 +208,20 @@ fi
 "${DOCKER[@]}" compose version < /dev/null >/dev/null 2>&1 || fail "Docker Compose is required and could not be found or installed."
 
 info "Docker and Docker Compose are available."
+
+# ---------------------------------------------------------------------------
+step "Choose an action"
+# ---------------------------------------------------------------------------
+
+printf '\n  1) Install or reinstall Gaming Hub\n'
+printf '  2) Uninstall Gaming Hub\n'
+printf '  3) Exit\n\n'
+MENU_CHOICE="$(ask_default "Selection" "1")"
+case "$MENU_CHOICE" in
+    2) uninstall_gaming_hub ;;
+    3) exit 0 ;;
+    *) ;;
+esac
 
 # ---------------------------------------------------------------------------
 step "Installation settings"
