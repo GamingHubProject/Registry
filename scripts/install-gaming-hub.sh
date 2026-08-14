@@ -390,6 +390,33 @@ done
 printf '\n'
 [[ "$PG_READY" == "yes" ]] || fail "PostgreSQL did not become ready in time."
 
+# PostgreSQL only applies POSTGRES_PASSWORD when it first initializes an
+# empty data volume — it silently ignores it on every later start. If .env's
+# DB_PASSWORD ever diverges from what a pre-existing volume actually has
+# (a stale volume from an earlier install, a restored .env, a past bug),
+# every later step fails with an opaque "password authentication failed"
+# deep inside migrate/key-generate. Catch that here instead.
+#
+# The check must go over the compose network to the "postgres" hostname, the
+# same path the app container uses: PostgreSQL's default pg_hba.conf trusts
+# the Unix socket and 127.0.0.1 unconditionally (docker compose exec would
+# always report success regardless of the password), and only enforces
+# scram-sha-256 for connections arriving from another host on the network.
+if ! "${DOCKER[@]}" compose -f "$COMPOSE_BASE" --env-file .env run --rm -T --no-deps \
+    --entrypoint psql -e PGPASSWORD="$DB_PASSWORD" postgres \
+    -h postgres -U "$DB_USERNAME" -d "$DB_DATABASE" -c 'SELECT 1' \
+    < /dev/null >/dev/null 2>&1; then
+    warn "PostgreSQL is up, but the password in .env doesn't match its stored credentials (likely a leftover data volume from an earlier install). Resetting it to match .env..."
+    # Reset via the container's own Unix socket, which PostgreSQL trusts
+    # unconditionally — this works precisely because it bypasses the check
+    # above, letting us fix a mismatch without knowing the old password.
+    "${DOCKER[@]}" compose -f "$COMPOSE_BASE" --env-file .env exec -T postgres \
+        psql -U "$DB_USERNAME" -c "ALTER USER \"${DB_USERNAME}\" WITH PASSWORD '${DB_PASSWORD}';" \
+        < /dev/null >/dev/null 2>&1 \
+        || fail "Could not authenticate to PostgreSQL or reset its password. If this is a reinstall over an old volume, wipe it first: docker compose -f ${COMPOSE_BASE} down -v"
+    info "PostgreSQL password reset to match .env."
+fi
+
 "${DOCKER[@]}" compose -f "$COMPOSE_BASE" --env-file .env build app < /dev/null
 
 if [[ -z "$EXISTING_APP_KEY" ]]; then
