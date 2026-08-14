@@ -15,7 +15,7 @@
 
 set -Eeuo pipefail
 
-INSTALLER_VERSION="1.1.0"
+INSTALLER_VERSION="0.1.001"
 REPO_OWNER="GamingHubProject"
 REPO_NAME="GamingHub"
 REPO_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}"
