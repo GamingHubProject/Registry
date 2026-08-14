@@ -15,7 +15,7 @@
 
 set -Eeuo pipefail
 
-INSTALLER_VERSION="1.0.0"
+INSTALLER_VERSION="1.1.0"
 REPO_OWNER="GamingHubProject"
 REPO_NAME="GamingHub"
 REPO_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}"
@@ -131,6 +131,261 @@ find_docker_command() {
     return 1
 }
 
+require_existing_install() {
+    INSTALL_DIR="$(ask_default "Install directory" "$DEFAULT_INSTALL_DIR")"
+    if [[ ! -f "${INSTALL_DIR}/.env" || ! -f "${INSTALL_DIR}/${COMPOSE_BASE}" ]]; then
+        fail "No existing Gaming Hub installation found at ${INSTALL_DIR}. Use 'Install or reinstall' first."
+    fi
+    cd "$INSTALL_DIR"
+}
+
+resolve_ref() {
+    local choice="$1"
+    if [[ "$choice" == "latest" ]]; then
+        LATEST_TAG="$(curl -fsSL --proto '=https' \
+            -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/tags" 2>/dev/null \
+            | grep -m1 '"name"' | sed -E 's/.*"name":\s*"([^"]+)".*/\1/' || true)"
+        if [[ -n "${LATEST_TAG:-}" ]]; then
+            REF="$LATEST_TAG"
+            REF_KIND="tags"
+        else
+            warn "Could not resolve the latest tag from GitHub's API (rate limited?). Falling back to 'main'."
+            REF="main"
+            REF_KIND="heads"
+        fi
+    else
+        REF="$choice"
+        # Best-effort: try it as a tag first, fall back to branch at download time.
+        REF_KIND="tags"
+    fi
+    info "Using ${REF} (${REF_KIND})."
+}
+
+download_ref() {
+    local kind="$1" ref="$2" url out
+    url="https://github.com/${REPO_OWNER}/${REPO_NAME}/archive/refs/${kind}/${ref}.zip"
+    out="${TMP_DIR}/source.zip"
+    curl --proto '=https' --proto-redir '=https' -fsSL --retry 3 --retry-delay 2 \
+        -o "$out" "$url" && printf '%s' "$out"
+}
+
+# Downloads $1 (at ref-kind $2) and installs it into $INSTALL_DIR, preserving
+# installer-managed files (.env, HTTPS config) across the re-download. Leaves
+# the shell in $INSTALL_DIR on success.
+download_and_extract() {
+    local ref="$1" ref_kind="$2"
+    TMP_DIR="$(mktemp -d)"
+    trap 'rm -rf "$TMP_DIR"' EXIT
+
+    SOURCE_ZIP="$(download_ref "$ref_kind" "$ref" || true)"
+    if [[ -z "${SOURCE_ZIP:-}" || ! -s "$SOURCE_ZIP" ]]; then
+        if [[ "$ref_kind" == "tags" ]]; then
+            warn "Could not download '${ref}' as a tag — trying it as a branch instead."
+            SOURCE_ZIP="$(download_ref "heads" "$ref" || true)"
+        fi
+    fi
+    [[ -n "${SOURCE_ZIP:-}" && -s "$SOURCE_ZIP" ]] || fail "Could not download ${REPO_URL} at ref '${ref}'."
+
+    unzip -q "$SOURCE_ZIP" -d "$TMP_DIR"
+    SOURCE_ROOT="$(find "$TMP_DIR" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+    [[ -n "$SOURCE_ROOT" ]] || fail "Downloaded archive did not contain a source directory."
+    [[ -f "$SOURCE_ROOT/artisan" ]] || fail "Downloaded archive does not look like Gaming Hub (no artisan file)."
+    [[ -f "$SOURCE_ROOT/$COMPOSE_BASE" ]] || fail "Downloaded archive is missing ${COMPOSE_BASE}."
+
+    info "Downloaded to a temporary directory. Installing into ${INSTALL_DIR}."
+
+    "${SUDO[@]}" mkdir -p "$INSTALL_DIR"
+    # Preserve installer-managed files across re-installs/upgrades.
+    for keep in .env "$DOMAIN_CONFIG_FILE" "$CADDY_CONFIG_DIR" "$COMPOSE_CADDY_FILE"; do
+        if [[ -e "${INSTALL_DIR}/${keep}" ]]; then
+            "${SUDO[@]}" cp -r "${INSTALL_DIR}/${keep}" "${TMP_DIR}/keep-$(basename "$keep")" 2>/dev/null || true
+        fi
+    done
+    "${SUDO[@]}" rsync -a --delete \
+        --exclude ".env" \
+        --exclude "${DOMAIN_CONFIG_FILE}" \
+        --exclude "${CADDY_CONFIG_DIR}" \
+        --exclude "${COMPOSE_CADDY_FILE}" \
+        "${SOURCE_ROOT}/" "${INSTALL_DIR}/" 2>/dev/null \
+        || "${SUDO[@]}" cp -r "${SOURCE_ROOT}/." "${INSTALL_DIR}/"
+    for keep in .env "$DOMAIN_CONFIG_FILE" "$CADDY_CONFIG_DIR" "$COMPOSE_CADDY_FILE"; do
+        if [[ -e "${TMP_DIR}/keep-$(basename "$keep")" ]]; then
+            "${SUDO[@]}" cp -r "${TMP_DIR}/keep-$(basename "$keep")" "${INSTALL_DIR}/${keep}"
+        fi
+    done
+    "${SUDO[@]}" chown -R "$(id -u)":"$(id -g)" "$INSTALL_DIR" 2>/dev/null || true
+
+    cd "$INSTALL_DIR"
+}
+
+# Builds the app image and brings the stack up. Assumes cwd is $INSTALL_DIR
+# and DB_USERNAME/DB_DATABASE/DB_PASSWORD/APP_PORT/EXISTING_APP_KEY are set
+# (from either fresh prompts or read back out of an existing .env).
+build_and_start() {
+    "${DOCKER[@]}" compose -f "$COMPOSE_BASE" --env-file .env up -d postgres < /dev/null
+
+    printf 'Waiting for PostgreSQL to accept connections'
+    PG_READY="no"
+    for _ in $(seq 1 30); do
+        if "${DOCKER[@]}" compose -f "$COMPOSE_BASE" --env-file .env exec -T postgres \
+            pg_isready -U "$DB_USERNAME" -d "$DB_DATABASE" < /dev/null >/dev/null 2>&1; then
+            PG_READY="yes"
+            break
+        fi
+        printf '.'
+        sleep 1
+    done
+    printf '\n'
+    [[ "$PG_READY" == "yes" ]] || fail "PostgreSQL did not become ready in time."
+
+    # PostgreSQL only applies POSTGRES_PASSWORD when it first initializes an
+    # empty data volume — it silently ignores it on every later start. If
+    # .env's DB_PASSWORD ever diverges from what a pre-existing volume
+    # actually has (a stale volume from an earlier install, a restored .env,
+    # a past bug), every later step fails with an opaque "password
+    # authentication failed" deep inside migrate/key-generate. Catch that
+    # here instead.
+    #
+    # The check must go over the compose network to the "postgres" hostname,
+    # the same path the app container uses: PostgreSQL's default
+    # pg_hba.conf trusts the Unix socket and 127.0.0.1 unconditionally
+    # (docker compose exec would always report success regardless of the
+    # password), and only enforces scram-sha-256 for connections arriving
+    # from another host on the network.
+    if ! "${DOCKER[@]}" compose -f "$COMPOSE_BASE" --env-file .env run --rm -T --no-deps \
+        --entrypoint psql -e PGPASSWORD="$DB_PASSWORD" postgres \
+        -h postgres -U "$DB_USERNAME" -d "$DB_DATABASE" -c 'SELECT 1' \
+        < /dev/null >/dev/null 2>&1; then
+        warn "PostgreSQL is up, but the password in .env doesn't match its stored credentials (likely a leftover data volume from an earlier install). Resetting it to match .env..."
+        # Reset via the container's own Unix socket, which PostgreSQL trusts
+        # unconditionally — this works precisely because it bypasses the
+        # check above, letting us fix a mismatch without knowing the old
+        # password.
+        "${DOCKER[@]}" compose -f "$COMPOSE_BASE" --env-file .env exec -T postgres \
+            psql -U "$DB_USERNAME" -c "ALTER USER \"${DB_USERNAME}\" WITH PASSWORD '${DB_PASSWORD}';" \
+            < /dev/null >/dev/null 2>&1 \
+            || fail "Could not authenticate to PostgreSQL or reset its password. If this is a reinstall over an old volume, wipe it first: docker compose -f ${COMPOSE_BASE} down -v"
+        info "PostgreSQL password reset to match .env."
+    fi
+
+    "${DOCKER[@]}" compose -f "$COMPOSE_BASE" --env-file .env build app < /dev/null
+
+    if [[ -z "$EXISTING_APP_KEY" ]]; then
+        info "Generating a permanent application encryption key."
+        APP_KEY_LINE="$("${DOCKER[@]}" compose -f "$COMPOSE_BASE" --env-file .env run --rm -T app \
+            php artisan key:generate --show < /dev/null 2>/dev/null | grep -m1 '^base64:' || true)"
+        [[ -n "$APP_KEY_LINE" ]] || fail "Failed to generate an application key. Run 'docker compose -f ${COMPOSE_BASE} run --rm -T app php artisan key:generate --show' manually to see the underlying error."
+        set_env_value .env APP_KEY "$APP_KEY_LINE"
+    fi
+
+    "${DOCKER[@]}" compose -f "$COMPOSE_BASE" --env-file .env up -d < /dev/null
+
+    printf 'Waiting for Gaming Hub to become available'
+    READY="no"
+    for _ in $(seq 1 30); do
+        if curl -fsS -o /dev/null "http://127.0.0.1:${APP_PORT}/admin/login" 2>/dev/null; then
+            READY="yes"
+            break
+        fi
+        printf '.'
+        sleep 2
+    done
+    printf '\n'
+    [[ "$READY" == "yes" ]] || warn "Gaming Hub did not respond within 60s — check 'docker compose -f ${COMPOSE_BASE} logs app'."
+}
+
+# Sets up (or refreshes) the Caddy HTTPS reverse proxy. Assumes cwd is
+# $INSTALL_DIR, .env exists, and APP_PORT is set. Sets CONFIGURE_HTTPS
+# (yes/no) and, if yes, DOMAIN for the caller's summary.
+configure_https() {
+    CONFIGURE_HTTPS="no"
+    if [[ -f "$DOMAIN_CONFIG_FILE" ]]; then
+        CONFIGURE_HTTPS="yes"
+        DOMAIN="$(awk -F= '$1 == "DOMAIN" { print $2; exit }' "$DOMAIN_CONFIG_FILE")"
+        info "Existing HTTPS configuration found for ${DOMAIN} — refreshing it."
+    elif ask_yes_no "Configure a domain with automatic HTTPS (via Caddy) now?" "n"; then
+        CONFIGURE_HTTPS="yes"
+        DOMAIN="$(ask_default "Domain (without https:// or a path)" "")"
+        valid_domain "$DOMAIN" || fail "'${DOMAIN}' doesn't look like a valid domain."
+        read -r -p "Certificate contact email (optional): " CERT_EMAIL </dev/tty || true
+
+        if command_exists dig; then
+            resolved="$(dig +short "$DOMAIN" 2>/dev/null | tail -n1 || true)"
+            [[ -n "$resolved" ]] || warn "The domain does not currently resolve (or DNS lookups aren't working from this host). Caddy cannot obtain a certificate until DNS points here."
+        fi
+    fi
+
+    if [[ "$CONFIGURE_HTTPS" == "yes" ]]; then
+        mkdir -p "$CADDY_CONFIG_DIR"
+        if [[ -n "${CERT_EMAIL:-}" ]]; then
+            cat > "${CADDY_CONFIG_DIR}/Caddyfile" <<CADDY
+{
+    email ${CERT_EMAIL}
+}
+
+${DOMAIN} {
+    reverse_proxy app:8000
+}
+CADDY
+        else
+            cat > "${CADDY_CONFIG_DIR}/Caddyfile" <<CADDY
+${DOMAIN} {
+    reverse_proxy app:8000
+}
+CADDY
+        fi
+
+        # Note: Compose merges list-type keys like `ports` across files
+        # rather than letting an override clear them, so app's direct port
+        # mapping from ${COMPOSE_BASE} stays published even with Caddy
+        # fronting it. Firewall off APP_PORT from the internet if you want
+        # HTTPS to be the only path in.
+        cat > "$COMPOSE_CADDY_FILE" <<COMPOSE
+services:
+  caddy:
+    image: ${CADDY_IMAGE}
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./${CADDY_CONFIG_DIR}:/etc/caddy:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - app
+volumes:
+  caddy_data:
+  caddy_config:
+COMPOSE
+
+        cat > "$DOMAIN_CONFIG_FILE" <<DOMAINCONF
+DOMAIN=${DOMAIN}
+EMAIL=${CERT_EMAIL:-}
+DOMAINCONF
+        chmod 600 "$DOMAIN_CONFIG_FILE"
+
+        set_env_value .env APP_URL "https://${DOMAIN}"
+        set_env_value .env COMPOSE_FILE "${COMPOSE_BASE}:${COMPOSE_CADDY_FILE}"
+
+        "${DOCKER[@]}" compose --env-file .env config < /dev/null >/dev/null \
+            || fail "The combined Gaming Hub and Caddy Compose configuration is invalid."
+        "${DOCKER[@]}" compose --env-file .env up -d --force-recreate app caddy < /dev/null
+
+        info "Caddy will request and renew the TLS certificate automatically once DNS and ports 80/443 are reachable from the internet."
+        warn "Note: Gaming Hub is still directly reachable on port ${APP_PORT} (unencrypted) alongside HTTPS. Firewall that port from the internet if you want HTTPS to be the only way in."
+        printf 'Check progress with: cd %s && docker compose logs -f caddy\n' "$INSTALL_DIR"
+    fi
+}
+
+# Ensures the stack is running, then hands off to the app's own interactive
+# admin-creation command. Assumes cwd is $INSTALL_DIR.
+create_admin_account() {
+    "${DOCKER[@]}" compose --env-file .env up -d < /dev/null
+    "${DOCKER[@]}" compose --env-file .env exec app php artisan gaming-hub:admin < /dev/tty
+}
+
 uninstall_gaming_hub() {
     local dir remove_data remove_files confirmation
     dir="$(ask_default "Install directory to uninstall" "$DEFAULT_INSTALL_DIR")"
@@ -168,6 +423,73 @@ uninstall_gaming_hub() {
     fi
 
     printf '\n\033[1;32mGaming Hub has been uninstalled.\033[0m\n'
+    exit 0
+}
+
+# Loads DB/app settings this action needs out of an existing .env, failing
+# clearly if the file looks incomplete (e.g. hand-edited, or from a version
+# of this installer that used different keys).
+load_existing_env_or_fail() {
+    DB_USERNAME="$(get_env_value .env DB_USERNAME)"
+    DB_DATABASE="$(get_env_value .env DB_DATABASE)"
+    DB_PASSWORD="$(get_env_value .env DB_PASSWORD)"
+    APP_PORT="$(get_env_value .env APP_PORT)"
+    EXISTING_APP_KEY="$(get_env_value .env APP_KEY)"
+    [[ -n "$DB_USERNAME" && -n "$DB_DATABASE" && -n "$DB_PASSWORD" && -n "$APP_PORT" ]] \
+        || fail "${INSTALL_DIR}/.env is missing required settings. Use 'Install or reinstall' instead."
+}
+
+update_gaming_hub() {
+    TOTAL_STEPS=5
+
+    step "Update settings"
+    require_existing_install
+    load_existing_env_or_fail
+
+    REF_CHOICE="$(ask_default "Version to update to: 'latest' tag, or a branch/tag name" "latest")"
+    resolve_ref "$REF_CHOICE"
+    ask_yes_no "Update Gaming Hub at ${INSTALL_DIR} to ${REF}?" || fail "Update cancelled."
+
+    step "Downloading Gaming Hub ${REF}"
+    download_and_extract "$REF" "$REF_KIND"
+
+    step "Building and starting Gaming Hub"
+    build_and_start
+
+    printf '\n\033[1;32mGaming Hub updated to %s.\033[0m\n' "$REF"
+    exit 0
+}
+
+https_only() {
+    TOTAL_STEPS=3
+
+    step "Locate installation"
+    require_existing_install
+    APP_PORT="$(get_env_value .env APP_PORT)"
+    [[ -n "$APP_PORT" ]] || fail "${INSTALL_DIR}/.env is missing APP_PORT. Use 'Install or reinstall' instead."
+    "${DOCKER[@]}" compose --env-file .env up -d < /dev/null
+
+    step "HTTPS"
+    configure_https
+
+    if [[ "$CONFIGURE_HTTPS" == "yes" ]]; then
+        printf '\n\033[1;32mHTTPS is set up: https://%s\033[0m\n' "$DOMAIN"
+    else
+        info "No changes made."
+    fi
+    exit 0
+}
+
+admin_only() {
+    TOTAL_STEPS=3
+
+    step "Locate installation"
+    require_existing_install
+
+    step "Administrator account"
+    create_admin_account
+
+    printf '\n\033[1;32mDone.\033[0m\n'
     exit 0
 }
 
@@ -227,12 +549,18 @@ step "Choose an action"
 # ---------------------------------------------------------------------------
 
 printf '\n  1) Install or reinstall Gaming Hub\n'
-printf '  2) Uninstall Gaming Hub\n'
-printf '  3) Exit\n\n'
+printf '  2) Update Gaming Hub to a newer version\n'
+printf '  3) Configure HTTPS (set up or change a domain)\n'
+printf '  4) Create or update an administrator account\n'
+printf '  5) Uninstall Gaming Hub\n'
+printf '  6) Exit\n\n'
 MENU_CHOICE="$(ask_default "Selection" "1")"
 case "$MENU_CHOICE" in
-    2) uninstall_gaming_hub ;;
-    3) exit 0 ;;
+    2) update_gaming_hub ;;
+    3) https_only ;;
+    4) admin_only ;;
+    5) uninstall_gaming_hub ;;
+    6) exit 0 ;;
     *) ;;
 esac
 
@@ -248,25 +576,7 @@ if [[ -f "${INSTALL_DIR}/.env" && -f "${INSTALL_DIR}/${COMPOSE_BASE}" ]]; then
 fi
 
 REF_CHOICE="$(ask_default "Version to install: 'latest' tag, or a branch/tag name" "latest")"
-if [[ "$REF_CHOICE" == "latest" ]]; then
-    LATEST_TAG="$(curl -fsSL --proto '=https' \
-        -H 'Accept: application/vnd.github+json' \
-        "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/tags" 2>/dev/null \
-        | grep -m1 '"name"' | sed -E 's/.*"name":\s*"([^"]+)".*/\1/' || true)"
-    if [[ -n "${LATEST_TAG:-}" ]]; then
-        REF="$LATEST_TAG"
-        REF_KIND="tags"
-    else
-        warn "Could not resolve the latest tag from GitHub's API (rate limited?). Falling back to 'main'."
-        REF="main"
-        REF_KIND="heads"
-    fi
-else
-    REF="$REF_CHOICE"
-    # Best-effort: try it as a tag first, fall back to branch at download time.
-    REF_KIND="tags"
-fi
-info "Installing ${REF} (${REF_KIND})."
+resolve_ref "$REF_CHOICE"
 
 DEFAULT_PORT="$(get_env_value "${INSTALL_DIR}/.env" APP_PORT)"
 APP_PORT="$(ask_default "Public HTTP port (used directly unless you configure a domain below)" "${DEFAULT_PORT:-8000}")"
@@ -314,56 +624,7 @@ ask_yes_no "Continue?" || fail "Installation cancelled."
 step "Downloading Gaming Hub ${REF}"
 # ---------------------------------------------------------------------------
 
-TMP_DIR="$(mktemp -d)"
-trap 'rm -rf "$TMP_DIR"' EXIT
-
-download_ref() {
-    local kind="$1" ref="$2" url out
-    url="https://github.com/${REPO_OWNER}/${REPO_NAME}/archive/refs/${kind}/${ref}.zip"
-    out="${TMP_DIR}/source.zip"
-    curl --proto '=https' --proto-redir '=https' -fsSL --retry 3 --retry-delay 2 \
-        -o "$out" "$url" && printf '%s' "$out"
-}
-
-SOURCE_ZIP="$(download_ref "$REF_KIND" "$REF" || true)"
-if [[ -z "${SOURCE_ZIP:-}" || ! -s "$SOURCE_ZIP" ]]; then
-    if [[ "$REF_KIND" == "tags" ]]; then
-        warn "Could not download '${REF}' as a tag — trying it as a branch instead."
-        SOURCE_ZIP="$(download_ref "heads" "$REF" || true)"
-    fi
-fi
-[[ -n "${SOURCE_ZIP:-}" && -s "$SOURCE_ZIP" ]] || fail "Could not download ${REPO_URL} at ref '${REF}'."
-
-unzip -q "$SOURCE_ZIP" -d "$TMP_DIR"
-SOURCE_ROOT="$(find "$TMP_DIR" -mindepth 1 -maxdepth 1 -type d -print -quit)"
-[[ -n "$SOURCE_ROOT" ]] || fail "Downloaded archive did not contain a source directory."
-[[ -f "$SOURCE_ROOT/artisan" ]] || fail "Downloaded archive does not look like Gaming Hub (no artisan file)."
-[[ -f "$SOURCE_ROOT/$COMPOSE_BASE" ]] || fail "Downloaded archive is missing ${COMPOSE_BASE}."
-
-info "Downloaded to a temporary directory. Installing into ${INSTALL_DIR}."
-
-"${SUDO[@]}" mkdir -p "$INSTALL_DIR"
-# Preserve installer-managed files across re-installs/upgrades.
-for keep in .env "$DOMAIN_CONFIG_FILE" "$CADDY_CONFIG_DIR" "$COMPOSE_CADDY_FILE"; do
-    if [[ -e "${INSTALL_DIR}/${keep}" ]]; then
-        "${SUDO[@]}" cp -r "${INSTALL_DIR}/${keep}" "${TMP_DIR}/keep-$(basename "$keep")" 2>/dev/null || true
-    fi
-done
-"${SUDO[@]}" rsync -a --delete \
-    --exclude ".env" \
-    --exclude "${DOMAIN_CONFIG_FILE}" \
-    --exclude "${CADDY_CONFIG_DIR}" \
-    --exclude "${COMPOSE_CADDY_FILE}" \
-    "${SOURCE_ROOT}/" "${INSTALL_DIR}/" 2>/dev/null \
-    || "${SUDO[@]}" cp -r "${SOURCE_ROOT}/." "${INSTALL_DIR}/"
-for keep in .env "$DOMAIN_CONFIG_FILE" "$CADDY_CONFIG_DIR" "$COMPOSE_CADDY_FILE"; do
-    if [[ -e "${TMP_DIR}/keep-$(basename "$keep")" ]]; then
-        "${SUDO[@]}" cp -r "${TMP_DIR}/keep-$(basename "$keep")" "${INSTALL_DIR}/${keep}"
-    fi
-done
-"${SUDO[@]}" chown -R "$(id -u)":"$(id -g)" "$INSTALL_DIR" 2>/dev/null || true
-
-cd "$INSTALL_DIR"
+download_and_extract "$REF" "$REF_KIND"
 
 # ---------------------------------------------------------------------------
 step "Writing configuration"
@@ -387,162 +648,20 @@ chmod 600 .env
 step "Building and starting Gaming Hub"
 # ---------------------------------------------------------------------------
 
-"${DOCKER[@]}" compose -f "$COMPOSE_BASE" --env-file .env up -d postgres < /dev/null
-
-printf 'Waiting for PostgreSQL to accept connections'
-PG_READY="no"
-for _ in $(seq 1 30); do
-    if "${DOCKER[@]}" compose -f "$COMPOSE_BASE" --env-file .env exec -T postgres \
-        pg_isready -U "$DB_USERNAME" -d "$DB_DATABASE" < /dev/null >/dev/null 2>&1; then
-        PG_READY="yes"
-        break
-    fi
-    printf '.'
-    sleep 1
-done
-printf '\n'
-[[ "$PG_READY" == "yes" ]] || fail "PostgreSQL did not become ready in time."
-
-# PostgreSQL only applies POSTGRES_PASSWORD when it first initializes an
-# empty data volume — it silently ignores it on every later start. If .env's
-# DB_PASSWORD ever diverges from what a pre-existing volume actually has
-# (a stale volume from an earlier install, a restored .env, a past bug),
-# every later step fails with an opaque "password authentication failed"
-# deep inside migrate/key-generate. Catch that here instead.
-#
-# The check must go over the compose network to the "postgres" hostname, the
-# same path the app container uses: PostgreSQL's default pg_hba.conf trusts
-# the Unix socket and 127.0.0.1 unconditionally (docker compose exec would
-# always report success regardless of the password), and only enforces
-# scram-sha-256 for connections arriving from another host on the network.
-if ! "${DOCKER[@]}" compose -f "$COMPOSE_BASE" --env-file .env run --rm -T --no-deps \
-    --entrypoint psql -e PGPASSWORD="$DB_PASSWORD" postgres \
-    -h postgres -U "$DB_USERNAME" -d "$DB_DATABASE" -c 'SELECT 1' \
-    < /dev/null >/dev/null 2>&1; then
-    warn "PostgreSQL is up, but the password in .env doesn't match its stored credentials (likely a leftover data volume from an earlier install). Resetting it to match .env..."
-    # Reset via the container's own Unix socket, which PostgreSQL trusts
-    # unconditionally — this works precisely because it bypasses the check
-    # above, letting us fix a mismatch without knowing the old password.
-    "${DOCKER[@]}" compose -f "$COMPOSE_BASE" --env-file .env exec -T postgres \
-        psql -U "$DB_USERNAME" -c "ALTER USER \"${DB_USERNAME}\" WITH PASSWORD '${DB_PASSWORD}';" \
-        < /dev/null >/dev/null 2>&1 \
-        || fail "Could not authenticate to PostgreSQL or reset its password. If this is a reinstall over an old volume, wipe it first: docker compose -f ${COMPOSE_BASE} down -v"
-    info "PostgreSQL password reset to match .env."
-fi
-
-"${DOCKER[@]}" compose -f "$COMPOSE_BASE" --env-file .env build app < /dev/null
-
-if [[ -z "$EXISTING_APP_KEY" ]]; then
-    info "Generating a permanent application encryption key."
-    APP_KEY_LINE="$("${DOCKER[@]}" compose -f "$COMPOSE_BASE" --env-file .env run --rm -T app \
-        php artisan key:generate --show < /dev/null 2>/dev/null | grep -m1 '^base64:' || true)"
-    [[ -n "$APP_KEY_LINE" ]] || fail "Failed to generate an application key. Run 'docker compose -f ${COMPOSE_BASE} run --rm -T app php artisan key:generate --show' manually to see the underlying error."
-    set_env_value .env APP_KEY "$APP_KEY_LINE"
-fi
-
-"${DOCKER[@]}" compose -f "$COMPOSE_BASE" --env-file .env up -d < /dev/null
-
-printf 'Waiting for Gaming Hub to become available'
-READY="no"
-for _ in $(seq 1 30); do
-    if curl -fsS -o /dev/null "http://127.0.0.1:${APP_PORT}/admin/login" 2>/dev/null; then
-        READY="yes"
-        break
-    fi
-    printf '.'
-    sleep 2
-done
-printf '\n'
-[[ "$READY" == "yes" ]] || warn "Gaming Hub did not respond within 60s — check 'docker compose -f ${COMPOSE_BASE} logs app'."
+build_and_start
 
 # ---------------------------------------------------------------------------
 step "HTTPS (optional)"
 # ---------------------------------------------------------------------------
 
-CONFIGURE_HTTPS="no"
-if [[ -f "$DOMAIN_CONFIG_FILE" ]]; then
-    CONFIGURE_HTTPS="yes"
-    DOMAIN="$(awk -F= '$1 == "DOMAIN" { print $2; exit }' "$DOMAIN_CONFIG_FILE")"
-    info "Existing HTTPS configuration found for ${DOMAIN} — refreshing it."
-elif ask_yes_no "Configure a domain with automatic HTTPS (via Caddy) now?" "n"; then
-    CONFIGURE_HTTPS="yes"
-    DOMAIN="$(ask_default "Domain (without https:// or a path)" "")"
-    valid_domain "$DOMAIN" || fail "'${DOMAIN}' doesn't look like a valid domain."
-    read -r -p "Certificate contact email (optional): " CERT_EMAIL </dev/tty || true
-
-    if command_exists dig; then
-        resolved="$(dig +short "$DOMAIN" 2>/dev/null | tail -n1 || true)"
-        [[ -n "$resolved" ]] || warn "The domain does not currently resolve (or DNS lookups aren't working from this host). Caddy cannot obtain a certificate until DNS points here."
-    fi
-fi
-
-if [[ "$CONFIGURE_HTTPS" == "yes" ]]; then
-    mkdir -p "$CADDY_CONFIG_DIR"
-    if [[ -n "${CERT_EMAIL:-}" ]]; then
-        cat > "${CADDY_CONFIG_DIR}/Caddyfile" <<CADDY
-{
-    email ${CERT_EMAIL}
-}
-
-${DOMAIN} {
-    reverse_proxy app:8000
-}
-CADDY
-    else
-        cat > "${CADDY_CONFIG_DIR}/Caddyfile" <<CADDY
-${DOMAIN} {
-    reverse_proxy app:8000
-}
-CADDY
-    fi
-
-    # Note: Compose merges list-type keys like `ports` across files rather
-    # than letting an override clear them, so app's direct port mapping from
-    # ${COMPOSE_BASE} stays published even with Caddy fronting it. Firewall
-    # off APP_PORT from the internet if you want HTTPS to be the only path in.
-    cat > "$COMPOSE_CADDY_FILE" <<COMPOSE
-services:
-  caddy:
-    image: ${CADDY_IMAGE}
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./${CADDY_CONFIG_DIR}:/etc/caddy:ro
-      - caddy_data:/data
-      - caddy_config:/config
-    depends_on:
-      - app
-volumes:
-  caddy_data:
-  caddy_config:
-COMPOSE
-
-    cat > "$DOMAIN_CONFIG_FILE" <<DOMAINCONF
-DOMAIN=${DOMAIN}
-EMAIL=${CERT_EMAIL:-}
-DOMAINCONF
-    chmod 600 "$DOMAIN_CONFIG_FILE"
-
-    set_env_value .env APP_URL "https://${DOMAIN}"
-    set_env_value .env COMPOSE_FILE "${COMPOSE_BASE}:${COMPOSE_CADDY_FILE}"
-
-    "${DOCKER[@]}" compose --env-file .env config < /dev/null >/dev/null \
-        || fail "The combined Gaming Hub and Caddy Compose configuration is invalid."
-    "${DOCKER[@]}" compose --env-file .env up -d --force-recreate app caddy < /dev/null
-
-    info "Caddy will request and renew the TLS certificate automatically once DNS and ports 80/443 are reachable from the internet."
-    warn "Note: Gaming Hub is still directly reachable on port ${APP_PORT} (unencrypted) alongside HTTPS. Firewall that port from the internet if you want HTTPS to be the only way in."
-    printf 'Check progress with: cd %s && docker compose logs -f caddy\n' "$INSTALL_DIR"
-fi
+configure_https
 
 # ---------------------------------------------------------------------------
 step "Administrator account"
 # ---------------------------------------------------------------------------
 
 if ask_yes_no "Create (or update) an administrator account now?"; then
-    "${DOCKER[@]}" compose --env-file .env exec app php artisan gaming-hub:admin < /dev/tty
+    create_admin_account
 fi
 
 # ---------------------------------------------------------------------------
@@ -559,3 +678,4 @@ printf '  docker compose -f %s logs -f app        # follow app logs\n' "$COMPOSE
 printf '  docker compose -f %s exec app php artisan gaming-hub:admin  # add/promote an admin\n' "$COMPOSE_BASE"
 printf '  docker compose -f %s restart app         # restart after config changes\n\n' "$COMPOSE_BASE"
 printf 'Configuration (including the database password and app key) lives in %s/.env — keep it safe.\n' "$INSTALL_DIR"
+printf 'Re-run this installer any time for: updates, HTTPS setup, or creating another admin account.\n'
