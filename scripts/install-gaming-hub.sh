@@ -116,6 +116,23 @@ get_env_value() {
     printf '%s' "$value"
 }
 
+# Sets the global COMPOSE_ARGS array to the explicit -f flags for this
+# install. Every "docker compose" call must use "${COMPOSE_ARGS[@]}" instead
+# of a bare --env-file .env — a downloaded install directory contains BOTH
+# docker-compose.yml (dev) and docker-compose.prod.yml (prod, what this
+# script actually builds/runs), and without an explicit -f, Compose's
+# default file-discovery silently picks the dev one: wrong image, a
+# hardcoded dev DB password, and a bind mount over the built image. That
+# mismatch crashes the app container the moment its entrypoint tries to
+# migrate with the wrong credentials — the exact "container ... is not
+# running" failure this fixes.
+compose_args() {
+    COMPOSE_ARGS=(-f "$COMPOSE_BASE")
+    if [[ -f "$DOMAIN_CONFIG_FILE" ]]; then
+        COMPOSE_ARGS+=(-f "$COMPOSE_CADDY_FILE")
+    fi
+}
+
 SUDO=()
 if [[ "$(id -u)" -ne 0 ]]; then
     command_exists sudo || fail "This installer needs root privileges (or sudo) to install packages and manage Docker."
@@ -223,12 +240,13 @@ download_and_extract() {
 # and DB_USERNAME/DB_DATABASE/DB_PASSWORD/APP_PORT/EXISTING_APP_KEY are set
 # (from either fresh prompts or read back out of an existing .env).
 build_and_start() {
-    "${DOCKER[@]}" compose -f "$COMPOSE_BASE" --env-file .env up -d postgres < /dev/null
+    compose_args
+    "${DOCKER[@]}" compose "${COMPOSE_ARGS[@]}" --env-file .env up -d postgres < /dev/null
 
     printf 'Waiting for PostgreSQL to accept connections'
     PG_READY="no"
     for _ in $(seq 1 30); do
-        if "${DOCKER[@]}" compose -f "$COMPOSE_BASE" --env-file .env exec -T postgres \
+        if "${DOCKER[@]}" compose "${COMPOSE_ARGS[@]}" --env-file .env exec -T postgres \
             pg_isready -U "$DB_USERNAME" -d "$DB_DATABASE" < /dev/null >/dev/null 2>&1; then
             PG_READY="yes"
             break
@@ -253,7 +271,7 @@ build_and_start() {
     # (docker compose exec would always report success regardless of the
     # password), and only enforces scram-sha-256 for connections arriving
     # from another host on the network.
-    if ! "${DOCKER[@]}" compose -f "$COMPOSE_BASE" --env-file .env run --rm -T --no-deps \
+    if ! "${DOCKER[@]}" compose "${COMPOSE_ARGS[@]}" --env-file .env run --rm -T --no-deps \
         --entrypoint psql -e PGPASSWORD="$DB_PASSWORD" postgres \
         -h postgres -U "$DB_USERNAME" -d "$DB_DATABASE" -c 'SELECT 1' \
         < /dev/null >/dev/null 2>&1; then
@@ -262,24 +280,24 @@ build_and_start() {
         # unconditionally — this works precisely because it bypasses the
         # check above, letting us fix a mismatch without knowing the old
         # password.
-        "${DOCKER[@]}" compose -f "$COMPOSE_BASE" --env-file .env exec -T postgres \
+        "${DOCKER[@]}" compose "${COMPOSE_ARGS[@]}" --env-file .env exec -T postgres \
             psql -U "$DB_USERNAME" -c "ALTER USER \"${DB_USERNAME}\" WITH PASSWORD '${DB_PASSWORD}';" \
             < /dev/null >/dev/null 2>&1 \
             || fail "Could not authenticate to PostgreSQL or reset its password. If this is a reinstall over an old volume, wipe it first: docker compose -f ${COMPOSE_BASE} down -v"
         info "PostgreSQL password reset to match .env."
     fi
 
-    "${DOCKER[@]}" compose -f "$COMPOSE_BASE" --env-file .env build app < /dev/null
+    "${DOCKER[@]}" compose "${COMPOSE_ARGS[@]}" --env-file .env build app < /dev/null
 
     if [[ -z "$EXISTING_APP_KEY" ]]; then
         info "Generating a permanent application encryption key."
-        APP_KEY_LINE="$("${DOCKER[@]}" compose -f "$COMPOSE_BASE" --env-file .env run --rm -T app \
+        APP_KEY_LINE="$("${DOCKER[@]}" compose "${COMPOSE_ARGS[@]}" --env-file .env run --rm -T app \
             php artisan key:generate --show < /dev/null 2>/dev/null | grep -m1 '^base64:' || true)"
         [[ -n "$APP_KEY_LINE" ]] || fail "Failed to generate an application key. Run 'docker compose -f ${COMPOSE_BASE} run --rm -T app php artisan key:generate --show' manually to see the underlying error."
         set_env_value .env APP_KEY "$APP_KEY_LINE"
     fi
 
-    "${DOCKER[@]}" compose -f "$COMPOSE_BASE" --env-file .env up -d < /dev/null
+    "${DOCKER[@]}" compose "${COMPOSE_ARGS[@]}" --env-file .env up -d < /dev/null
 
     printf 'Waiting for Gaming Hub to become available'
     READY="no"
@@ -367,11 +385,11 @@ DOMAINCONF
         chmod 600 "$DOMAIN_CONFIG_FILE"
 
         set_env_value .env APP_URL "https://${DOMAIN}"
-        set_env_value .env COMPOSE_FILE "${COMPOSE_BASE}:${COMPOSE_CADDY_FILE}"
 
-        "${DOCKER[@]}" compose --env-file .env config < /dev/null >/dev/null \
+        compose_args
+        "${DOCKER[@]}" compose "${COMPOSE_ARGS[@]}" --env-file .env config < /dev/null >/dev/null \
             || fail "The combined Gaming Hub and Caddy Compose configuration is invalid."
-        "${DOCKER[@]}" compose --env-file .env up -d --force-recreate app caddy < /dev/null
+        "${DOCKER[@]}" compose "${COMPOSE_ARGS[@]}" --env-file .env up -d --force-recreate app caddy < /dev/null
 
         info "Caddy will request and renew the TLS certificate automatically once DNS and ports 80/443 are reachable from the internet."
         warn "Note: Gaming Hub is still directly reachable on port ${APP_PORT} (unencrypted) alongside HTTPS. Firewall that port from the internet if you want HTTPS to be the only way in."
@@ -382,8 +400,9 @@ DOMAINCONF
 # Ensures the stack is running, then hands off to the app's own interactive
 # admin-creation command. Assumes cwd is $INSTALL_DIR.
 create_admin_account() {
-    "${DOCKER[@]}" compose --env-file .env up -d < /dev/null
-    "${DOCKER[@]}" compose --env-file .env exec app php artisan gaming-hub:admin < /dev/tty
+    compose_args
+    "${DOCKER[@]}" compose "${COMPOSE_ARGS[@]}" --env-file .env up -d < /dev/null
+    "${DOCKER[@]}" compose "${COMPOSE_ARGS[@]}" --env-file .env exec app php artisan gaming-hub:admin < /dev/tty
 }
 
 uninstall_gaming_hub() {
@@ -409,10 +428,11 @@ uninstall_gaming_hub() {
     [[ "$confirmation" == "UNINSTALL" ]] || fail "Uninstall cancelled — nothing was changed."
 
     cd "$dir"
+    compose_args
     if [[ "$remove_data" == "yes" ]]; then
-        "${DOCKER[@]}" compose --env-file .env down -v < /dev/null
+        "${DOCKER[@]}" compose "${COMPOSE_ARGS[@]}" --env-file .env down -v < /dev/null
     else
-        "${DOCKER[@]}" compose --env-file .env down < /dev/null
+        "${DOCKER[@]}" compose "${COMPOSE_ARGS[@]}" --env-file .env down < /dev/null
         info "Containers removed. The PostgreSQL data volume was kept — reinstalling into the same directory will reuse it."
     fi
 
@@ -467,7 +487,8 @@ https_only() {
     require_existing_install
     APP_PORT="$(get_env_value .env APP_PORT)"
     [[ -n "$APP_PORT" ]] || fail "${INSTALL_DIR}/.env is missing APP_PORT. Use 'Install or reinstall' instead."
-    "${DOCKER[@]}" compose --env-file .env up -d < /dev/null
+    compose_args
+    "${DOCKER[@]}" compose "${COMPOSE_ARGS[@]}" --env-file .env up -d < /dev/null
 
     step "HTTPS"
     configure_https
