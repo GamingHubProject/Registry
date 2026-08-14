@@ -72,8 +72,16 @@ random_secret() {
     fi
 }
 
+trim() {
+    local s="$1"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "$s"
+}
+
 set_env_value() {
-    local file="$1" key="$2" value="$3" temporary
+    local file="$1" key="$2" value temporary
+    value="$(trim "$3")"
     temporary="$(mktemp)"
     if [[ -f "$file" ]]; then
         awk -v key="$key" -v value="$value" '
@@ -95,10 +103,15 @@ get_env_value() {
     local file="$1" key="$2" value
     [[ -f "$file" ]] || return 0
     value="$(awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$file")"
+    # Trim whitespace unconditionally — this also self-heals values that were
+    # written with a stray leading space by older, buggy versions of this
+    # installer (e.g. "DB_USERNAME= gaming_hub" baked into an existing .env).
+    value="$(trim "$value")"
     # Normalize away one layer of surrounding double quotes, regardless of
     # whether the value was originally stored quoted or bare.
     if [[ "$value" == \"*\" && "$value" == *\" ]]; then
         value="${value:1:-1}"
+        value="$(trim "$value")"
     fi
     printf '%s' "$value"
 }
