@@ -283,7 +283,15 @@ build_and_start() {
         "${DOCKER[@]}" compose "${COMPOSE_ARGS[@]}" --env-file .env exec -T postgres \
             psql -U "$DB_USERNAME" -c "ALTER USER \"${DB_USERNAME}\" WITH PASSWORD '${DB_PASSWORD}';" \
             < /dev/null >/dev/null 2>&1 \
-            || fail "Could not authenticate to PostgreSQL or reset its password. If this is a reinstall over an old volume, wipe it first: docker compose -f ${COMPOSE_BASE} down -v"
+            || fail "Could not authenticate to PostgreSQL or reset its password.
+  First, look at what's actually wrong (this usually explains it):
+    docker compose -f ${COMPOSE_BASE} logs postgres
+  Do NOT run 'docker compose down -v' to work around this unless you have
+  confirmed you want to permanently delete ALL data in this install — every
+  game, server, and user account. That command destroys the database volume
+  irrecoverably; it is not a routine fix. If you truly need a clean slate,
+  use this installer's own 'Uninstall Gaming Hub' menu option instead, which
+  asks for explicit confirmation before touching data."
         info "PostgreSQL password reset to match .env."
     fi
 
