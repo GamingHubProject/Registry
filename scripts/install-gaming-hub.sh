@@ -92,9 +92,15 @@ set_env_value() {
 }
 
 get_env_value() {
-    local file="$1" key="$2"
+    local file="$1" key="$2" value
     [[ -f "$file" ]] || return 0
-    awk -F= -v key="$key" '$1 == key { $1=""; sub(/^=/,""); print; exit }' "$file"
+    value="$(awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$file")"
+    # Normalize away one layer of surrounding double quotes, regardless of
+    # whether the value was originally stored quoted or bare.
+    if [[ "$value" == \"*\" && "$value" == *\" ]]; then
+        value="${value:1:-1}"
+    fi
+    printf '%s' "$value"
 }
 
 SUDO=()
