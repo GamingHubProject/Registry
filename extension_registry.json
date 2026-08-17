@@ -3,5 +3,18 @@
   "id": "gaminghubproject-official",
   "name": "GamingHubProject Official Registry",
   "homepage": "https://github.com/GamingHubProject",
-  "packages": []
+  "packages": [
+    {
+      "id": "basic-connectors",
+      "name": "Basic Connectors",
+      "description": "Common game-panel Connectors — Pelican fully implemented, Pterodactyl and AMP stubbed.",
+      "author": "GamingHubProject",
+      "category": "Connectors",
+      "repository": "https://github.com/GamingHubProject/BasicConnectors",
+      "release_asset": "basic-connectors-*.zip",
+      "checksum_asset": "SHA256SUMS",
+      "verified": true,
+      "official": true
+    }
+  ]
 }
