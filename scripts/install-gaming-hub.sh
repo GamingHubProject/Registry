@@ -571,7 +571,7 @@ load_existing_env_or_fail() {
 }
 
 update_gaming_hub() {
-    TOTAL_STEPS=6
+    TOTAL_STEPS=7
 
     step "Update settings"
     require_existing_install
@@ -596,6 +596,19 @@ update_gaming_hub() {
     step "Building and starting Gaming Hub"
     build_and_start
     record_installed_ref "$REF"
+
+    step "Refreshing the Geo-IP database"
+    # Monthly-cadence data, not install-blocking — this is the update
+    # flow's natural "already expected to run periodically" hook rather
+    # than adding a whole new cron mechanism just for this one file. A
+    # failure here never fails the update itself: the app already
+    # degrades gracefully to no country data when this file is missing
+    # or stale (see GeoIpLookup), so a warning is the right severity, not
+    # a hard stop.
+    compose_args
+    if ! "${DOCKER[@]}" compose "${COMPOSE_ARGS[@]}" --env-file .env exec -T app php artisan gaming-hub:geoip-update < /dev/null; then
+        warn "Geo-IP database update failed — country lookups in the audit log will keep using whatever data (if any) is already there. Safe to ignore, or run it again later: docker compose -f ${COMPOSE_BASE} exec app php artisan gaming-hub:geoip-update"
+    fi
 
     printf '\n\033[1;32mGaming Hub updated to %s.\033[0m\n' "$REF"
     exit 0
