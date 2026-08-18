@@ -235,9 +235,15 @@ show_version_diff() {
     fi
 
     info "${ahead_by} commit(s) ahead of your current install:"
+    # Commit messages come back as JSON strings with literal \n escapes for
+    # real newlines, not actual line breaks — a multi-paragraph commit body
+    # would otherwise print with raw "\n\n" characters cluttering the
+    # preview. Cutting at the first \n keeps just the subject line, which
+    # is also all that fits usefully in a one-line bullet anyway.
     printf '%s' "$compare" \
         | grep -o '"message": *"[^"]*"' \
-        | sed -E 's/"message": *"/  - /; s/"$//' \
+        | sed -E 's/"message": *"//; s/"$//; s/\\n.*//' \
+        | sed -E 's/^/  - /; s/^(.{0,90}).*/\1/' \
         | head -10
     return 0
 }
