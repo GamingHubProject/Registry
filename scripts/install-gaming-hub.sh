@@ -433,13 +433,17 @@ build_and_start() {
         set_env_value .env APP_KEY "$APP_KEY_LINE"
     fi
 
-    # --force-recreate on app specifically: env_file only injects .env's
+    # --force-recreate on app AND scheduler: env_file only injects .env's
     # values into a container at creation time, so a plain "up -d" against
     # an already-running, image-unchanged container (e.g. re-running
     # Install with the same ref) would silently keep stale values from
     # whenever it was last created — confirmed by hitting exactly this
     # while diagnosing a real SESSION_DOMAIN/SANCTUM_STATEFUL_DOMAINS bug.
-    "${DOCKER[@]}" compose "${COMPOSE_ARGS[@]}" --env-file .env up -d --force-recreate app < /dev/null
+    # scheduler shares app's image tag (see docker-compose.prod.yml) but
+    # was missing here entirely — confirmed for real during a production
+    # update: the image was rebuilt and app got the new code, but scheduler
+    # (never recreated) kept running the old image indefinitely.
+    "${DOCKER[@]}" compose "${COMPOSE_ARGS[@]}" --env-file .env up -d --force-recreate app scheduler < /dev/null
 
     printf 'Waiting for Gaming Hub to become available'
     READY="no"
