@@ -559,7 +559,7 @@ uninstall_gaming_hub() {
         && remove_files="yes"
 
     printf '\nThis cannot be undone. Type UNINSTALL to confirm, anything else to cancel: '
-    read -r confirmation
+    read -r confirmation </dev/tty
     [[ "$confirmation" == "UNINSTALL" ]] || fail "Uninstall cancelled — nothing was changed."
 
     cd "$dir"
