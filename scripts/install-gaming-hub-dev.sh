@@ -38,6 +38,35 @@ ask_yes_no() {
     [[ "$answer" =~ ^[Yy] ]]
 }
 
+trim() {
+    local s="$1"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "$s"
+}
+
+# In-place set (replacing the first match, appending if absent) — ported
+# from the production installer's own helper of the same name.
+set_env_value() {
+    local file="$1" key="$2" value temporary
+    value="$(trim "$3")"
+    temporary="$(mktemp)"
+    if [[ -f "$file" ]]; then
+        awk -v key="$key" -v value="$value" '
+            BEGIN { replaced = 0 }
+            index($0, key "=") == 1 {
+                if (!replaced) { print key "=" value; replaced = 1 }
+                next
+            }
+            { print }
+            END { if (!replaced) print key "=" value }
+        ' "$file" > "$temporary"
+    else
+        printf '%s=%s\n' "$key" "$value" > "$temporary"
+    fi
+    mv "$temporary" "$file"
+}
+
 # Runs a noisy, fire-and-forget command (composer/npm/docker/artisan) in the
 # background, showing a spinner instead of letting its output scroll by, and
 # dumping the captured log only if it fails. Returns the command's real exit
@@ -178,21 +207,32 @@ spa_start() {
     run_step "Installing SPA dependencies (npm ci)" compose exec -T -w /app/spa app npm ci
 
     step "Starting the SPA dev server"
-    compose exec -d -w /app/spa app sh -c \
-        'setsid npm run dev -- --host 0.0.0.0 > vite-dev.log 2>&1 < /dev/null & echo $! > .vite-dev.pid'
+    local attempt ready="no"
+    for attempt in 1 2; do
+        compose exec -d -w /app/spa app sh -c \
+            'setsid npm run dev -- --host 0.0.0.0 > vite-dev.log 2>&1 < /dev/null & echo $! > .vite-dev.pid'
 
-    local ready="no"
-    for _ in $(seq 1 15); do
-        if curl -fsS -o /dev/null "$SPA_URL" 2>/dev/null; then
-            ready="yes"
-            break
-        fi
-        sleep 1
+        for _ in $(seq 1 15); do
+            if curl -fsS -o /dev/null "$SPA_URL" 2>/dev/null; then
+                ready="yes"
+                break
+            fi
+            sleep 1
+        done
+        [[ "$ready" == "yes" ]] && break
+        # A detached `exec -d` launch has occasionally not taken — seen
+        # once as its shell becoming a zombie with an empty log, no
+        # npm/vite process ever actually starting. Not reproduced when
+        # spa_start is called on its own outside a fresh-install run, so
+        # this looks like a transient exec timing issue rather than a
+        # logic bug; one retry is cheap insurance against it either way.
+        [[ "$attempt" -eq 1 ]] && warn "First attempt to start the SPA dev server didn't respond — retrying once."
     done
+
     if [[ "$ready" == "yes" ]]; then
         info "SPA dev server running: $SPA_URL"
     else
-        warn "SPA dev server did not respond within 15s — check: docker compose exec app cat spa/vite-dev.log"
+        warn "SPA dev server did not respond after 2 attempts — check: docker compose exec app cat spa/vite-dev.log"
     fi
 }
 
@@ -238,8 +278,33 @@ install_gaming_hub() {
         info ".env already exists — leaving it untouched."
     fi
 
+    step "Configuring .env for local development"
+    # .env.example ships placeholder values meant for the production
+    # installer's real-domain case (example.com) — copying those as-is
+    # here breaks session-cookie auth outright, since the cookie's Domain
+    # attribute would never match the host the browser actually connected
+    # to. Local dev is always plain http://localhost, so there's no
+    # legitimate case where these three should be anything else — always
+    # correct them, whether .env was just freshly copied or already
+    # existed (self-heals a previously-broken install too).
+    set_env_value "$PLATFORM_DIR/.env" APP_URL "$APP_URL"
+    set_env_value "$PLATFORM_DIR/.env" SESSION_DOMAIN "localhost"
+    set_env_value "$PLATFORM_DIR/.env" SANCTUM_STATEFUL_DOMAINS "localhost:8010,localhost:5173"
+
     step "Starting Docker Compose (HTTP only, port 8010)"
+    # --force-recreate on app/scheduler specifically: docker-compose.yml's
+    # env_file directive bakes .env's values into the container's actual
+    # OS environment at container-creation time only. A plain "up -d"
+    # against an already-running container (the common case when
+    # re-running Install over an existing checkout) does nothing to an
+    # unchanged container — confirmed by hitting exactly this while fixing
+    # the .env bug above: editing the file and even restarting the app
+    # inside the container left the stale baked-in values in place until
+    # the container itself was recreated. postgres is deliberately left
+    # out of the force-recreate — these env changes don't concern it, and
+    # recreating it unnecessarily risks its own startup/connection dance.
     run_step "docker compose up -d" compose up -d
+    run_step "recreating app/scheduler for the current .env" compose up -d --force-recreate app scheduler
 
     step "Installing PHP dependencies"
     run_step "composer install" compose run --rm app composer install
@@ -332,7 +397,18 @@ update_gaming_hub() {
     step "Running migrations"
     run_step "php artisan migrate" compose run --rm app php artisan migrate --force
 
+    step "Configuring .env for local development"
+    # Self-heals an install from before this fix existed — same reasoning
+    # as the Install flow's own copy of this step.
+    set_env_value "$PLATFORM_DIR/.env" APP_URL "$APP_URL"
+    set_env_value "$PLATFORM_DIR/.env" SESSION_DOMAIN "localhost"
+    set_env_value "$PLATFORM_DIR/.env" SANCTUM_STATEFUL_DOMAINS "localhost:8010,localhost:5173"
+
     step "Restarting Docker Compose"
+    # down + up (not just up -d) recreates every container, which is also
+    # what makes docker-compose.yml's env_file directive actually pick up
+    # the .env values just written above — an already-running container
+    # keeps whatever it was created with regardless of file edits.
     run_step "docker compose down" compose down
     run_step "docker compose up -d" compose up -d
 

@@ -408,7 +408,13 @@ build_and_start() {
         set_env_value .env APP_KEY "$APP_KEY_LINE"
     fi
 
-    "${DOCKER[@]}" compose "${COMPOSE_ARGS[@]}" --env-file .env up -d < /dev/null
+    # --force-recreate on app specifically: env_file only injects .env's
+    # values into a container at creation time, so a plain "up -d" against
+    # an already-running, image-unchanged container (e.g. re-running
+    # Install with the same ref) would silently keep stale values from
+    # whenever it was last created — confirmed by hitting exactly this
+    # while diagnosing a real SESSION_DOMAIN/SANCTUM_STATEFUL_DOMAINS bug.
+    "${DOCKER[@]}" compose "${COMPOSE_ARGS[@]}" --env-file .env up -d --force-recreate app < /dev/null
 
     printf 'Waiting for Gaming Hub to become available'
     READY="no"
@@ -496,6 +502,8 @@ DOMAINCONF
         chmod 600 "$DOMAIN_CONFIG_FILE"
 
         set_env_value .env APP_URL "https://${DOMAIN}"
+        set_env_value .env SESSION_DOMAIN "$DOMAIN"
+        set_env_value .env SANCTUM_STATEFUL_DOMAINS "$DOMAIN"
 
         compose_args
         "${DOCKER[@]}" compose "${COMPOSE_ARGS[@]}" --env-file .env config < /dev/null >/dev/null \
@@ -797,6 +805,15 @@ set_env_value .env DB_PORT 5432
 set_env_value .env DB_DATABASE "$DB_DATABASE"
 set_env_value .env DB_USERNAME "$DB_USERNAME"
 set_env_value .env DB_PASSWORD "$DB_PASSWORD"
+# .env.example ships placeholder values for these two (meant to be filled
+# in per-deployment) — clear them rather than let a stray "example.com"
+# survive into a real install. Left blank here (Laravel's own default is
+# null) until/unless configure_https sets a real domain below: a guessed
+# value that doesn't match how the site is actually reached would break
+# session cookies exactly like the placeholder did, so "unset" is the
+# only universally-correct default without a known domain.
+set_env_value .env SESSION_DOMAIN ""
+set_env_value .env SANCTUM_STATEFUL_DOMAINS ""
 chmod 600 .env
 
 # ---------------------------------------------------------------------------
