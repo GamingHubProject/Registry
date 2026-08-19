@@ -331,7 +331,16 @@ download_and_extract() {
 # DB_USERNAME/DB_DATABASE are already set (from load_existing_env_or_fail).
 backup_database() {
     local backup_dir="${INSTALL_DIR}/backups" backup_file
+    # SUDO is unconditional for any non-root user (needed elsewhere for
+    # apt-get, writing under /opt, etc.), so a bare "sudo mkdir" here would
+    # create this directory owned by root even though $INSTALL_DIR itself
+    # is already chowned to the invoking user — the very next line's plain,
+    # unprivileged "pg_dump > file" redirect then can't write into it.
+    # Confirmed for real: first Update on a fresh production install failed
+    # here with "Permission denied". Chown it back so the redirect works
+    # regardless of whether sudo actually needed to elevate for the mkdir.
     "${SUDO[@]}" mkdir -p "$backup_dir"
+    "${SUDO[@]}" chown "$(id -u)":"$(id -g)" "$backup_dir"
     backup_file="${backup_dir}/gaming_hub_$(date +%Y%m%d_%H%M%S).sql"
 
     step "Backing up database"
