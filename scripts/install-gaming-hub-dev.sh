@@ -20,9 +20,20 @@ CORE_DIR="$BASE_DIR/gaming-hub-core"
 PLATFORM_REPO="https://github.com/GamingHubProject/GamingHub.git"
 CORE_REPO="https://github.com/GamingHubProject/Core.git"
 BACKUP_DIR="$BASE_DIR/gaming-hub-backups"
+INSTANCE_REGISTRY="$BASE_DIR/.gaming-hub-instances"
+
+# Set by resolve_instance() before any of Install/Update/Admin/Uninstall
+# run — every use below is a placeholder until then.
+INSTANCE=""
+APP_PORT=8010
+SPA_PORT=5173
+PG_PORT=5432
+DB_NAME="gaming_hub"
+PROJECT_NAME="gaming-hub-dev"
 APP_URL="http://localhost:8010"
 SPA_URL="http://localhost:5173"
-SPA_PID_FILE="$PLATFORM_DIR/spa/.vite-dev.pid"
+ENV_FILE="$PLATFORM_DIR/.env"
+SPA_PID_FILE="$PLATFORM_DIR/spa/.vite-dev.dev.pid"
 
 info()  { printf '\033[0;32m%s\033[0m\n' "$1"; }
 warn()  { printf '\033[1;33m%s\033[0m\n' "$1"; }
@@ -36,6 +47,12 @@ ask_yes_no() {
     read -r -p "${prompt} ${suffix}: " answer </dev/tty
     answer="${answer:-$default_answer}"
     [[ "$answer" =~ ^[Yy] ]]
+}
+
+ask_default() {
+    local prompt="$1" default_value="$2" answer
+    read -r -p "${prompt} [${default_value}]: " answer </dev/tty
+    printf '%s' "${answer:-$default_value}"
 }
 
 trim() {
@@ -119,7 +136,15 @@ require_docker() {
 }
 
 compose() {
-    (cd "$PLATFORM_DIR" && "${COMPOSE_CMD[@]}" "$@")
+    (
+        cd "$PLATFORM_DIR" &&
+        GAMING_HUB_APP_PORT="$APP_PORT" \
+        GAMING_HUB_SPA_PORT="$SPA_PORT" \
+        GAMING_HUB_PG_PORT="$PG_PORT" \
+        GAMING_HUB_DB_NAME="$DB_NAME" \
+        GAMING_HUB_ENV_FILE="$ENV_FILE" \
+        "${COMPOSE_CMD[@]}" -p "$PROJECT_NAME" "$@"
+    )
 }
 
 # Dumps the local dev database to $BACKUP_DIR before a migration is about to
@@ -130,10 +155,10 @@ compose() {
 # already about to delete everything), there's no "continue anyway" here.
 backup_database() {
     mkdir -p "$BACKUP_DIR"
-    local backup_file="$BACKUP_DIR/gaming_hub_$(date +%Y%m%d_%H%M%S).sql"
+    local backup_file="$BACKUP_DIR/${DB_NAME}_$(date +%Y%m%d_%H%M%S).sql"
 
     step "Backing up database"
-    if ! compose exec -T postgres pg_dump -U gaming_hub gaming_hub > "$backup_file" 2>/dev/null; then
+    if ! compose exec -T postgres pg_dump -U gaming_hub "$DB_NAME" > "$backup_file" 2>/dev/null; then
         rm -f "$backup_file"
         fail "Database backup failed — aborting before touching anything. Check 'docker compose logs postgres' and try again."
     fi
@@ -173,6 +198,81 @@ check_pending_commits() {
 }
 
 # ---------------------------------------------------------------------------
+# Multi-instance support — several independent installs from the same
+# checkout, each with its own ports/database/Compose project (e.g. "dev",
+# "staging", "palworld"). All instances share $PLATFORM_DIR (one codebase,
+# bind-mounted into every instance's own containers) — they don't need
+# separate git clones, just separate runtime config.
+# ---------------------------------------------------------------------------
+
+# Looks up $1's port offset in $INSTANCE_REGISTRY, assigning and persisting
+# the next free one (current max + 10, starting at 10) if this name hasn't
+# been seen before. 0 is never handed out here — it's permanently reserved
+# for "dev" (see resolve_instance), even on a registry that predates this
+# feature and has no literal "dev" line in it.
+resolve_instance_offset() {
+    local name="$1" offset max
+    mkdir -p "$BASE_DIR"
+    touch "$INSTANCE_REGISTRY"
+
+    offset="$(awk -v n="$name" '$1 == n { print $2; exit }' "$INSTANCE_REGISTRY")"
+    if [[ -n "$offset" ]]; then
+        printf '%s' "$offset"
+        return 0
+    fi
+
+    max="$(awk '{ if ($2+0 > m) m = $2+0 } END { print m+0 }' "$INSTANCE_REGISTRY")"
+    offset=$(( max < 10 ? 10 : max + 10 ))
+    printf '%s %s\n' "$name" "$offset" >> "$INSTANCE_REGISTRY"
+    printf '%s' "$offset"
+}
+
+# Prompts for an instance name and populates every instance-scoped global
+# (APP_PORT, SPA_PORT, PG_PORT, DB_NAME, PROJECT_NAME, APP_URL, SPA_URL,
+# ENV_FILE, SPA_PID_FILE) from it. Must run before any of Install/Update/
+# Admin/Uninstall touch Docker or .env. $require_existing (pass "yes" from
+# Update/Uninstall) fails clearly on a name never seen in the registry
+# instead of silently registering a typo as a brand-new instance.
+resolve_instance() {
+    local require_existing="${1:-no}"
+
+    INSTANCE="$(ask_default "Instance name" "dev")"
+    [[ "$INSTANCE" =~ ^[a-z0-9][a-z0-9-]*$ ]] \
+        || fail "Instance name must be lowercase letters, digits, and hyphens only (e.g. dev, staging, palworld)."
+
+    if [[ "$require_existing" == "yes" && "$INSTANCE" != "dev" ]]; then
+        mkdir -p "$BASE_DIR"; touch "$INSTANCE_REGISTRY"
+        grep -q "^${INSTANCE} " "$INSTANCE_REGISTRY" \
+            || fail "Instance '${INSTANCE}' was never installed. Known instances: dev $(cut -d' ' -f1 "$INSTANCE_REGISTRY" | tr '\n' ' ')"
+    fi
+
+    local offset
+    if [[ "$INSTANCE" == "dev" ]]; then
+        # The original, pre-multi-instance default: bare .env, bare
+        # "gaming_hub" database, offset 0 — matching every install that
+        # predates this feature exactly, so nothing already running under
+        # plain "dev" needs any migration.
+        offset=0
+        ENV_FILE="$PLATFORM_DIR/.env"
+        DB_NAME="gaming_hub"
+    else
+        offset="$(resolve_instance_offset "$INSTANCE")"
+        ENV_FILE="$PLATFORM_DIR/.env.${INSTANCE}"
+        DB_NAME="gaming_hub_${INSTANCE}"
+    fi
+
+    APP_PORT=$((8010 + offset))
+    SPA_PORT=$((5173 + offset))
+    PG_PORT=$((5432 + offset))
+    PROJECT_NAME="gaming-hub-${INSTANCE}"
+    APP_URL="http://localhost:${APP_PORT}"
+    SPA_URL="http://localhost:${SPA_PORT}"
+    SPA_PID_FILE="$PLATFORM_DIR/spa/.vite-dev.${INSTANCE}.pid"
+
+    info "Instance '${INSTANCE}': app=${APP_PORT} spa=${SPA_PORT} db=${DB_NAME} project=${PROJECT_NAME}"
+}
+
+# ---------------------------------------------------------------------------
 # SPA dev server (spa/, separate Vite + React project — see Priority 16B)
 # ---------------------------------------------------------------------------
 
@@ -191,14 +291,18 @@ check_pending_commits() {
 # alive and still bound to 5173. setsid at launch makes the whole chain one
 # process group, so killing the negative PID (the group) takes all of it
 # down together instead of orphaning the actual server underneath.
+# File names are per-instance ($INSTANCE) even though every instance's
+# container bind-mounts the same shared $PLATFORM_DIR/spa — without that,
+# two instances' containers would collide on the exact same host path for
+# their own separate dev-server processes.
 spa_is_running() {
     [[ -f "$SPA_PID_FILE" ]] || return 1
-    compose exec -T app sh -c 'kill -0 "$(cat /app/spa/.vite-dev.pid)" 2>/dev/null' </dev/null
+    compose exec -T app sh -c "kill -0 \"\$(cat /app/spa/.vite-dev.${INSTANCE}.pid)\" 2>/dev/null" </dev/null
 }
 
 spa_stop() {
     if [[ -f "$SPA_PID_FILE" ]]; then
-        compose exec -T app sh -c 'kill -- -"$(cat /app/spa/.vite-dev.pid)" 2>/dev/null || true' </dev/null
+        compose exec -T app sh -c "kill -- -\"\$(cat /app/spa/.vite-dev.${INSTANCE}.pid)\" 2>/dev/null || true" </dev/null
         rm -f "$SPA_PID_FILE"
     fi
 }
@@ -209,8 +313,11 @@ spa_start() {
     step "Starting the SPA dev server"
     local attempt ready="no"
     for attempt in 1 2; do
+        # VITE_API_BASE_URL points this instance's SPA at its own backend
+        # port — without it the client.ts default (localhost:8010) would
+        # have every instance's SPA calling the "dev" instance's API.
         compose exec -d -w /app/spa app sh -c \
-            'setsid npm run dev -- --host 0.0.0.0 > vite-dev.log 2>&1 < /dev/null & echo $! > .vite-dev.pid'
+            "VITE_API_BASE_URL=${APP_URL} setsid npm run dev -- --host 0.0.0.0 > vite-dev.${INSTANCE}.log 2>&1 < /dev/null & echo \$! > .vite-dev.${INSTANCE}.pid"
 
         for _ in $(seq 1 15); do
             if curl -fsS -o /dev/null "$SPA_URL" 2>/dev/null; then
@@ -232,7 +339,7 @@ spa_start() {
     if [[ "$ready" == "yes" ]]; then
         info "SPA dev server running: $SPA_URL"
     else
-        warn "SPA dev server did not respond after 2 attempts — check: docker compose exec app cat spa/vite-dev.log"
+        warn "SPA dev server did not respond after 2 attempts — check: docker compose exec app cat spa/vite-dev.${INSTANCE}.log"
     fi
 }
 
@@ -240,20 +347,25 @@ spa_start() {
 # Option 1: Install
 # ---------------------------------------------------------------------------
 install_gaming_hub() {
+    resolve_instance
     require_docker
     mkdir -p "$BASE_DIR"
 
-    local existing_install="no"
-    [[ -d "$PLATFORM_DIR/.git" ]] && existing_install="yes"
-
-    if [[ "$existing_install" == "yes" ]]; then
+    # "Existing" is per-instance, not per-checkout: the codebase at
+    # $PLATFORM_DIR is shared across every instance, but each instance's
+    # own .env file only exists once that specific instance has actually
+    # been installed before.
+    if [[ -f "$ENV_FILE" ]]; then
         step "Existing install detected"
-        if ! ask_yes_no "An existing install was found at $PLATFORM_DIR. Preserve its existing data?" "y"; then
+        if ! ask_yes_no "An existing '${INSTANCE}' install was found. Preserve its existing data?" "y"; then
             printf '\nThis permanently deletes the local database and everything in it.\n'
             printf 'Type WIPE to confirm, anything else to cancel: '
             read -r confirmation </dev/tty
             [[ "$confirmation" == "WIPE" ]] || fail "Cancelled — nothing was changed."
             step "Wiping existing data"
+            # Scoped to this instance only — compose() always passes -p
+            # "$PROJECT_NAME", so this can never touch another instance's
+            # containers/volume even though they share the same checkout.
             compose down --volumes 2>/dev/null || true
             info "Existing data wiped."
         fi
@@ -272,10 +384,10 @@ install_gaming_hub() {
     fi
 
     step "Preparing .env"
-    if [[ ! -f "$PLATFORM_DIR/.env" ]]; then
-        cp "$PLATFORM_DIR/.env.example" "$PLATFORM_DIR/.env"
+    if [[ ! -f "$ENV_FILE" ]]; then
+        cp "$PLATFORM_DIR/.env.example" "$ENV_FILE"
     else
-        info ".env already exists — leaving it untouched."
+        info "$(basename "$ENV_FILE") already exists — leaving it untouched."
     fi
 
     step "Configuring .env for local development"
@@ -287,22 +399,32 @@ install_gaming_hub() {
     # legitimate case where these three should be anything else — always
     # correct them, whether .env was just freshly copied or already
     # existed (self-heals a previously-broken install too).
-    set_env_value "$PLATFORM_DIR/.env" APP_URL "$APP_URL"
-    set_env_value "$PLATFORM_DIR/.env" SESSION_DOMAIN "localhost"
-    set_env_value "$PLATFORM_DIR/.env" SANCTUM_STATEFUL_DOMAINS "localhost:8010,localhost:5173"
+    set_env_value "$ENV_FILE" APP_URL "$APP_URL"
+    set_env_value "$ENV_FILE" SESSION_DOMAIN "localhost"
+    set_env_value "$ENV_FILE" SANCTUM_STATEFUL_DOMAINS "localhost:${APP_PORT},localhost:${SPA_PORT}"
+    # docker-compose.yml's environment: block sets DB_DATABASE too, but that
+    # never reaches actual HTTP requests: "php artisan serve" spawns the
+    # real request-handling "php -S" child with a minimal, hardcoded env
+    # (just APP_ENV/PATH — confirmed via /proc/<pid>/environ), not the
+    # container's full environment. That child falls back to whatever
+    # DB_DATABASE is written in this file, so it has to be correct here too
+    # — otherwise every instance except the one whose file happens to
+    # already say "gaming_hub" silently serves requests against the wrong
+    # database while artisan/tinker/migrate (no serve subprocess involved)
+    # look completely fine.
+    set_env_value "$ENV_FILE" DB_DATABASE "$DB_NAME"
 
-    step "Starting Docker Compose (HTTP only, port 8010)"
-    # --force-recreate on app/scheduler specifically: docker-compose.yml's
-    # env_file directive bakes .env's values into the container's actual
-    # OS environment at container-creation time only. A plain "up -d"
-    # against an already-running container (the common case when
-    # re-running Install over an existing checkout) does nothing to an
-    # unchanged container — confirmed by hitting exactly this while fixing
-    # the .env bug above: editing the file and even restarting the app
-    # inside the container left the stale baked-in values in place until
-    # the container itself was recreated. postgres is deliberately left
-    # out of the force-recreate — these env changes don't concern it, and
-    # recreating it unnecessarily risks its own startup/connection dance.
+    step "Starting Docker Compose (instance '${INSTANCE}', port ${APP_PORT})"
+    # --force-recreate on app/scheduler specifically: this file mount only
+    # takes effect at container-creation time. A plain "up -d" against an
+    # already-running container (the common case when re-running Install
+    # over an existing checkout) does nothing to an unchanged container —
+    # confirmed by hitting exactly this while fixing the .env bug above:
+    # editing the file and even restarting the app inside the container
+    # left the stale mount/env in place until the container itself was
+    # recreated. postgres is deliberately left out of the force-recreate —
+    # these env changes don't concern it, and recreating it unnecessarily
+    # risks its own startup/connection dance.
     run_step "docker compose up -d" compose up -d
     run_step "recreating app/scheduler for the current .env" compose up -d --force-recreate app scheduler
 
@@ -314,7 +436,7 @@ install_gaming_hub() {
     run_step "npm run build" compose run --rm -e HOME=/tmp app npm run build
 
     step "Setting the application key (if not already set)"
-    if ! grep -q '^APP_KEY=base64:' "$PLATFORM_DIR/.env" 2>/dev/null; then
+    if ! grep -q '^APP_KEY=base64:' "$ENV_FILE" 2>/dev/null; then
         run_step "php artisan key:generate" compose run --rm app php artisan key:generate --force
     fi
 
@@ -347,7 +469,7 @@ install_gaming_hub() {
     fi
 
     echo
-    info "Install complete."
+    info "Install complete — instance '${INSTANCE}'."
     echo "  App:   $APP_URL"
     echo "  Admin: $APP_URL/admin"
     echo "  SPA:   $SPA_URL"
@@ -357,8 +479,10 @@ install_gaming_hub() {
 # Option 2: Update
 # ---------------------------------------------------------------------------
 update_gaming_hub() {
+    resolve_instance "yes"
     require_docker
     [[ -d "$PLATFORM_DIR/.git" ]] || fail "gaming-hub isn't installed at $PLATFORM_DIR — run Install first."
+    [[ -f "$ENV_FILE" ]] || fail "Instance '${INSTANCE}' is registered but has no $(basename "$ENV_FILE") — run Install for it first."
 
     step "Checking for updates"
     local platform_pending="no" core_pending="no"
@@ -400,9 +524,10 @@ update_gaming_hub() {
     step "Configuring .env for local development"
     # Self-heals an install from before this fix existed — same reasoning
     # as the Install flow's own copy of this step.
-    set_env_value "$PLATFORM_DIR/.env" APP_URL "$APP_URL"
-    set_env_value "$PLATFORM_DIR/.env" SESSION_DOMAIN "localhost"
-    set_env_value "$PLATFORM_DIR/.env" SANCTUM_STATEFUL_DOMAINS "localhost:8010,localhost:5173"
+    set_env_value "$ENV_FILE" APP_URL "$APP_URL"
+    set_env_value "$ENV_FILE" SESSION_DOMAIN "localhost"
+    set_env_value "$ENV_FILE" SANCTUM_STATEFUL_DOMAINS "localhost:${APP_PORT},localhost:${SPA_PORT}"
+    set_env_value "$ENV_FILE" DB_DATABASE "$DB_NAME"
 
     step "Restarting Docker Compose"
     # down + up (not just up -d) recreates every container, which is also
@@ -420,7 +545,7 @@ update_gaming_hub() {
     spa_start
 
     echo
-    info "Update complete — $APP_URL"
+    info "Update complete — instance '${INSTANCE}' — $APP_URL"
     info "SPA: $SPA_URL"
 }
 
@@ -428,10 +553,11 @@ update_gaming_hub() {
 # Option 3: Create admin account
 # ---------------------------------------------------------------------------
 create_admin() {
+    resolve_instance "yes"
     require_docker
-    [[ -d "$PLATFORM_DIR/.git" ]] || fail "gaming-hub isn't installed at $PLATFORM_DIR — run Install first."
+    [[ -f "$ENV_FILE" ]] || fail "Instance '${INSTANCE}' isn't installed — run Install first."
 
-    step "Create or promote an administrator account"
+    step "Create or promote an administrator account (instance '${INSTANCE}')"
     # gaming-hub:admin prompts for name/email/password itself and re-running
     # it against an existing email promotes that account to Admin instead
     # of creating a duplicate — reusing it here instead of re-implementing
@@ -452,14 +578,15 @@ setup_https() {
 # Option 5: Uninstall
 # ---------------------------------------------------------------------------
 uninstall_gaming_hub() {
+    resolve_instance "yes"
     require_docker
     [[ -d "$PLATFORM_DIR" ]] || fail "Nothing found at $PLATFORM_DIR."
 
-    if ask_yes_no "Back up the database before uninstalling?" "y"; then
+    if ask_yes_no "Back up the '${INSTANCE}' database before uninstalling?" "y"; then
         mkdir -p "$BACKUP_DIR"
-        local backup_file="$BACKUP_DIR/gaming_hub_$(date +%Y%m%d_%H%M%S).sql"
+        local backup_file="$BACKUP_DIR/${DB_NAME}_$(date +%Y%m%d_%H%M%S).sql"
         step "Backing up database to $backup_file"
-        if compose exec -T postgres pg_dump -U gaming_hub gaming_hub > "$backup_file"; then
+        if compose exec -T postgres pg_dump -U gaming_hub "$DB_NAME" > "$backup_file"; then
             info "Backup saved: $backup_file"
         else
             warn "Backup failed (is the postgres container running?) — continuing anyway."
@@ -468,20 +595,28 @@ uninstall_gaming_hub() {
     fi
 
     echo
-    printf 'Type UNINSTALL to confirm removing the Docker containers, anything else to cancel: '
+    printf 'Type UNINSTALL to confirm removing the "%s" instance'"'"'s Docker containers, anything else to cancel: ' "$INSTANCE"
     read -r confirmation </dev/tty
     [[ "$confirmation" == "UNINSTALL" ]] || fail "Uninstall cancelled — nothing was changed."
 
-    step "Removing Docker containers"
+    step "Removing Docker containers (instance '${INSTANCE}')"
     if ask_yes_no "Also delete the database volume? This permanently destroys all data not backed up above." "n"; then
         compose down --volumes
     else
         compose down
     fi
 
+    if [[ "$INSTANCE" != "dev" ]]; then
+        mkdir -p "$BASE_DIR"; touch "$INSTANCE_REGISTRY"
+        grep -v "^${INSTANCE} " "$INSTANCE_REGISTRY" > "${INSTANCE_REGISTRY}.tmp" 2>/dev/null || true
+        mv "${INSTANCE_REGISTRY}.tmp" "$INSTANCE_REGISTRY"
+        rm -f "$ENV_FILE"
+        info "Removed instance '${INSTANCE}' from the registry and deleted $(basename "$ENV_FILE")."
+    fi
+
     echo
     info "Docker containers removed."
-    echo "Source code at $PLATFORM_DIR and $CORE_DIR was left in place — delete those directories yourself if you want them gone too."
+    echo "Source code at $PLATFORM_DIR and $CORE_DIR is shared across every instance and was left in place."
 }
 
 # ---------------------------------------------------------------------------

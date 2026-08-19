@@ -128,7 +128,16 @@ get_env_value() {
 # migrate with the wrong credentials — the exact "container ... is not
 # running" failure this fixes.
 compose_args() {
-    COMPOSE_ARGS=(-f "$COMPOSE_BASE")
+    # -p ties every "docker compose" call to this specific instance's own
+    # project — without it, two installs on the same host (e.g. this
+    # default "prod" one and a second "staging" instance elsewhere) would
+    # collide on Compose's own default project naming and could end up
+    # sharing containers, volumes, or even each other's built image.
+    # GAMING_HUB_INSTANCE is always set by this point — either prompted
+    # fresh (Install) or read back out of an existing install's own .env
+    # (require_existing_install) — but the "prod" fallback still covers a
+    # pre-existing install from before this variable existed.
+    COMPOSE_ARGS=(-p "gaming-hub-${GAMING_HUB_INSTANCE:-prod}" -f "$COMPOSE_BASE")
     if [[ -f "$DOMAIN_CONFIG_FILE" ]]; then
         COMPOSE_ARGS+=(-f "$COMPOSE_CADDY_FILE")
     fi
@@ -155,6 +164,13 @@ require_existing_install() {
         fail "No existing Gaming Hub installation found at ${INSTALL_DIR}. Use 'Install or reinstall' first."
     fi
     cd "$INSTALL_DIR"
+    # Read back rather than re-prompt — the instance identity was fixed
+    # when this directory was first installed (see "Writing configuration"),
+    # so Update/HTTPS/admin/Uninstall always target the right one without
+    # asking again. "prod" covers an install from before this existed.
+    GAMING_HUB_INSTANCE="$(get_env_value .env GAMING_HUB_INSTANCE)"
+    export GAMING_HUB_INSTANCE="${GAMING_HUB_INSTANCE:-prod}"
+    info "Instance: ${GAMING_HUB_INSTANCE}"
 }
 
 resolve_ref() {
@@ -547,6 +563,9 @@ uninstall_gaming_hub() {
     [[ "$confirmation" == "UNINSTALL" ]] || fail "Uninstall cancelled — nothing was changed."
 
     cd "$dir"
+    GAMING_HUB_INSTANCE="$(get_env_value .env GAMING_HUB_INSTANCE)"
+    export GAMING_HUB_INSTANCE="${GAMING_HUB_INSTANCE:-prod}"
+    info "Instance: ${GAMING_HUB_INSTANCE}"
     compose_args
     if [[ "$remove_data" == "yes" ]]; then
         "${DOCKER[@]}" compose "${COMPOSE_ARGS[@]}" --env-file .env down -v < /dev/null
@@ -738,6 +757,17 @@ if [[ -f "${INSTALL_DIR}/.env" && -f "${INSTALL_DIR}/${COMPOSE_BASE}" ]]; then
     info "Existing installation detected at ${INSTALL_DIR} — settings below default to its current values."
 fi
 
+# Identifies this install's own Compose project (gaming-hub-<instance>) so
+# a second install elsewhere on the same host — a staging copy, a
+# different game's deployment — never collides with this one on
+# containers, volumes, or the built image. Stored in .env below so
+# Update/HTTPS/admin/Uninstall can read it back without asking again.
+DEFAULT_INSTANCE="$(get_env_value "${INSTALL_DIR}/.env" GAMING_HUB_INSTANCE)"
+GAMING_HUB_INSTANCE="$(ask_default "Instance name" "${DEFAULT_INSTANCE:-prod}")"
+[[ "$GAMING_HUB_INSTANCE" =~ ^[a-z0-9][a-z0-9-]*$ ]] \
+    || fail "Instance name must be lowercase letters, digits, and hyphens only (e.g. prod, staging, palworld)."
+export GAMING_HUB_INSTANCE
+
 REF_CHOICE="$(ask_default "Version to install: 'latest' tag, or a branch/tag name" "latest")"
 resolve_ref "$REF_CHOICE"
 
@@ -752,7 +782,11 @@ DEFAULT_APP_NAME="$(get_env_value "${INSTALL_DIR}/.env" APP_NAME)"
 APP_NAME="$(ask_default "Site name" "${DEFAULT_APP_NAME:-Gaming Hub}")"
 
 DEFAULT_DB_NAME="$(get_env_value "${INSTALL_DIR}/.env" DB_DATABASE)"
-DB_DATABASE="$(ask_default "PostgreSQL database name" "${DEFAULT_DB_NAME:-gaming_hub}")"
+if [[ -z "$DEFAULT_DB_NAME" ]]; then
+    DEFAULT_DB_NAME="gaming_hub"
+    [[ "$GAMING_HUB_INSTANCE" != "prod" ]] && DEFAULT_DB_NAME="gaming_hub_${GAMING_HUB_INSTANCE}"
+fi
+DB_DATABASE="$(ask_default "PostgreSQL database name" "$DEFAULT_DB_NAME")"
 DEFAULT_DB_USER="$(get_env_value "${INSTALL_DIR}/.env" DB_USERNAME)"
 DB_USERNAME="$(ask_default "PostgreSQL username" "${DEFAULT_DB_USER:-gaming_hub}")"
 
@@ -775,6 +809,7 @@ DEFAULT_TZ="$(get_env_value "${INSTALL_DIR}/.env" APP_TIMEZONE)"
 APP_TIMEZONE="$(ask_default "Application timezone" "${DEFAULT_TZ:-$SYSTEM_TIMEZONE}")"
 
 printf '\n\033[1;35mSummary\033[0m\n'
+printf '  Instance:           %s\n' "$GAMING_HUB_INSTANCE"
 printf '  Install directory:  %s\n' "$INSTALL_DIR"
 printf '  Version:            %s\n' "$REF"
 printf '  HTTP port:          %s\n' "$APP_PORT"
@@ -794,6 +829,7 @@ step "Writing configuration"
 # ---------------------------------------------------------------------------
 
 [[ -f .env ]] || cp .env.example .env
+set_env_value .env GAMING_HUB_INSTANCE "$GAMING_HUB_INSTANCE"
 set_env_value .env APP_NAME "\"${APP_NAME}\""
 set_env_value .env APP_ENV production
 set_env_value .env APP_TIMEZONE "$APP_TIMEZONE"
