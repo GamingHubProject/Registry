@@ -423,6 +423,14 @@ build_and_start() {
         info "PostgreSQL password reset to match .env."
     fi
 
+    # No progress indicator between steps here beyond Docker's own build
+    # output, and a first build (or one after a dependency change) genuinely
+    # takes several minutes — composer + two separate npm installs, then two
+    # Vite builds. Stretches of that (dependency resolution, apt package
+    # installs in the base layer) print little or nothing for a while,
+    # which reads as a hang to anyone watching the terminal. Say so up
+    # front rather than leaving that silence unexplained.
+    info "Building the application image — this can take several minutes on a first build or after a dependency change (cached and much faster otherwise)."
     "${DOCKER[@]}" compose "${COMPOSE_ARGS[@]}" --env-file .env build app < /dev/null
 
     if [[ -z "$EXISTING_APP_KEY" ]]; then
