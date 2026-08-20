@@ -799,6 +799,19 @@ if command_exists ss && ss -ltnH "sport = :${APP_PORT}" 2>/dev/null | grep -q .;
     warn "Port ${APP_PORT} looks like it's already in use on this host."
 fi
 
+# Login sessions are cookie-based (Sanctum), and Sanctum only treats a
+# request as cookie-authenticated if its Origin/Referer host matches
+# SANCTUM_STATEFUL_DOMAINS below — so this needs to be the actual
+# host/IP browsers will use, not a guess. Wrong if left hardcoded to
+# "localhost" for anyone reaching the server via its LAN IP or a real
+# hostname without going through the HTTPS/domain flow below (which
+# already asks for and uses a real DOMAIN instead of this prompt).
+DEFAULT_ACCESS_HOST="$(get_env_value "${INSTALL_DIR}/.env" APP_URL)"
+DEFAULT_ACCESS_HOST="${DEFAULT_ACCESS_HOST#http://}"
+DEFAULT_ACCESS_HOST="${DEFAULT_ACCESS_HOST#https://}"
+DEFAULT_ACCESS_HOST="${DEFAULT_ACCESS_HOST%%:*}"
+ACCESS_HOST="$(ask_default "Hostname or IP this server will be accessed at (e.g. a LAN IP if accessed from other devices)" "${DEFAULT_ACCESS_HOST:-localhost}")"
+
 DEFAULT_APP_NAME="$(get_env_value "${INSTALL_DIR}/.env" APP_NAME)"
 APP_NAME="$(ask_default "Site name" "${DEFAULT_APP_NAME:-Gaming Hub}")"
 
@@ -833,6 +846,7 @@ printf '\n\033[1;35mSummary\033[0m\n'
 printf '  Instance:           %s\n' "$GAMING_HUB_INSTANCE"
 printf '  Install directory:  %s\n' "$INSTALL_DIR"
 printf '  Version:            %s\n' "$REF"
+printf '  Access host:        %s\n' "$ACCESS_HOST"
 printf '  HTTP port:          %s\n' "$APP_PORT"
 printf '  Site name:          %s\n' "$APP_NAME"
 printf '  Database:           %s (user: %s)\n' "$DB_DATABASE" "$DB_USERNAME"
@@ -855,22 +869,28 @@ set_env_value .env APP_NAME "\"${APP_NAME}\""
 set_env_value .env APP_ENV production
 set_env_value .env APP_TIMEZONE "$APP_TIMEZONE"
 set_env_value .env APP_PORT "$APP_PORT"
-set_env_value .env APP_URL "http://localhost:${APP_PORT}"
+set_env_value .env APP_URL "http://${ACCESS_HOST}:${APP_PORT}"
 set_env_value .env DB_CONNECTION pgsql
 set_env_value .env DB_HOST postgres
 set_env_value .env DB_PORT 5432
 set_env_value .env DB_DATABASE "$DB_DATABASE"
 set_env_value .env DB_USERNAME "$DB_USERNAME"
 set_env_value .env DB_PASSWORD "$DB_PASSWORD"
-# .env.example ships placeholder values for these two (meant to be filled
-# in per-deployment) — clear them rather than let a stray "example.com"
-# survive into a real install. Left blank here (Laravel's own default is
-# null) until/unless configure_https sets a real domain below: a guessed
-# value that doesn't match how the site is actually reached would break
-# session cookies exactly like the placeholder did, so "unset" is the
-# only universally-correct default without a known domain.
+# SESSION_DOMAIN stays blank on purpose: ACCESS_HOST may be a bare LAN
+# IP, and some browsers silently drop cookies whose explicit Domain
+# attribute is an IP address. Leaving it unset makes Laravel issue a
+# host-only cookie instead, which is valid for any host (IP, hostname,
+# or localhost) and is exactly right for a single-host deployment.
+#
+# SANCTUM_STATEFUL_DOMAINS has no such hazard and does need a real
+# value: Sanctum only treats a request as cookie-authenticated (needed
+# for the SPA's session-based login) if its Origin/Referer host matches
+# an entry here, so leaving it blank silently breaks SPA login on every
+# install that doesn't go through the HTTPS/domain flow below (which
+# sets it from a real DOMAIN instead). If configure_https runs later it
+# overwrites both this and SESSION_DOMAIN with that real domain.
 set_env_value .env SESSION_DOMAIN ""
-set_env_value .env SANCTUM_STATEFUL_DOMAINS ""
+set_env_value .env SANCTUM_STATEFUL_DOMAINS "${ACCESS_HOST}:${APP_PORT}"
 chmod 600 .env
 
 # ---------------------------------------------------------------------------
