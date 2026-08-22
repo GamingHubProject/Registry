@@ -456,7 +456,7 @@ build_and_start() {
     printf 'Waiting for Gaming Hub to become available'
     READY="no"
     for _ in $(seq 1 30); do
-        if curl -fsS -o /dev/null "http://127.0.0.1:${APP_PORT}/admin/login" 2>/dev/null; then
+        if curl -fsS -o /dev/null "http://127.0.0.1:${APP_PORT}/admin/system/login" 2>/dev/null; then
             READY="yes"
             break
         fi
@@ -930,10 +930,10 @@ fi
 printf '\n\033[1;32mGaming Hub is installed.\033[0m\n\n'
 if [[ "$CONFIGURE_HTTPS" == "yes" ]]; then
     printf '  https://%s\n' "$DOMAIN"
-    printf '  https://%s/admin\n\n' "$DOMAIN"
+    printf '  https://%s/admin/system\n\n' "$DOMAIN"
 else
     printf '  http://SERVER-IP:%s\n' "$APP_PORT"
-    printf '  http://SERVER-IP:%s/admin\n\n' "$APP_PORT"
+    printf '  http://SERVER-IP:%s/admin/system\n\n' "$APP_PORT"
 fi
 printf 'Useful commands (from %s):\n' "$INSTALL_DIR"
 printf '  docker compose -f %s logs -f app        # follow app logs\n' "$COMPOSE_BASE"
