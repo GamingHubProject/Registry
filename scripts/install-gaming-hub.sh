@@ -234,14 +234,43 @@ resolve_ref() {
 # fresh directory, or an install done by a version of this script that
 # predates this file). Never fails; absence just means "no comparison
 # possible," not an error.
+#
+# The file holds two lines: the ref name, then the commit SHA it resolved
+# to at the time (added by record_installed_ref below, to catch a tag
+# later being force-moved to a different commit while keeping its name —
+# see show_version_diff). A file from an older version of this script has
+# only the first line; the SHA line is then simply empty, handled as
+# "unknown" rather than an error.
 read_installed_ref() {
     if [[ -f "$INSTALLED_REF_FILE" ]]; then
-        cat "$INSTALLED_REF_FILE" 2>/dev/null || true
+        sed -n '1p' "$INSTALLED_REF_FILE" 2>/dev/null || true
+    fi
+}
+
+read_installed_ref_sha() {
+    if [[ -f "$INSTALLED_REF_FILE" ]]; then
+        sed -n '2p' "$INSTALLED_REF_FILE" 2>/dev/null || true
     fi
 }
 
 record_installed_ref() {
-    printf '%s\n' "$1" > "$INSTALLED_REF_FILE"
+    local ref="$1" sha
+    sha="$(resolve_ref_sha "$ref")"
+    printf '%s\n%s\n' "$ref" "$sha" > "$INSTALLED_REF_FILE"
+}
+
+# Resolves a tag/branch/SHA to the commit SHA it currently points at right
+# now, via GitHub's Commits API — unlike a raw git ref, this transparently
+# peels an annotated tag to its underlying commit, so it works the same
+# for lightweight and annotated tags alike. Empty output means "couldn't
+# resolve" (rate limited, ref doesn't exist, network down); callers must
+# treat that as inconclusive, not as an equality/inequality answer.
+resolve_ref_sha() {
+    local ref="$1"
+    curl -fsSL --proto '=https' \
+        -H 'Accept: application/vnd.github+json' \
+        "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/commits/${ref}" 2>/dev/null \
+        | grep -m1 '"sha"' | sed -E 's/[^"]*"sha": *"([^"]*)".*/\1/' || true
 }
 
 # Shows what's actually different between the currently-installed ref and
@@ -260,8 +289,42 @@ show_version_diff() {
     fi
 
     if [[ "$previous" == "$target" ]]; then
-        info "Already on ${target} — nothing to update."
-        return 1
+        # A matching ref *name* isn't proof there's nothing to update — a
+        # tag can be force-moved to point at a different commit (e.g.
+        # correcting a missed deployment, exactly what happened to
+        # v0.1.006.01) while keeping its name. Resolving $previous by name
+        # here would just re-resolve to the tag's *current* (post-move)
+        # commit — same problem, one level down — so this instead reads
+        # back the commit SHA actually recorded at the last successful
+        # install/update (read_installed_ref_sha) and compares that
+        # against what the target ref resolves to right now.
+        local previous_sha target_sha
+        previous_sha="$(read_installed_ref_sha)"
+        target_sha="$(resolve_ref_sha "$target")"
+
+        if [[ -z "$previous_sha" ]]; then
+            warn "No commit was recorded for the current install (it predates this check) — trusting the name match."
+            info "Already on ${target} — nothing to update."
+            return 1
+        fi
+
+        if [[ -z "$target_sha" ]]; then
+            warn "Could not resolve ${target} to a commit to check for a re-pointed tag (rate limited?) — trusting the name match."
+            info "Already on ${target} — nothing to update."
+            return 1
+        fi
+
+        if [[ "$previous_sha" == "$target_sha" ]]; then
+            info "Already on ${target} — nothing to update."
+            return 1
+        fi
+
+        info "${target} now points at a different commit than what's installed — the tag was re-pointed. Treating this as an update."
+        # From here on, compare against the actual commit that was
+        # installed, not the ref name (which now resolves to the *new*
+        # commit and would make the diff below compare a ref against
+        # itself).
+        previous="$previous_sha"
     fi
 
     info "Currently installed: ${previous}"
