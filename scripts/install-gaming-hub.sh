@@ -15,7 +15,7 @@
 
 set -Eeuo pipefail
 
-INSTALLER_VERSION="0.1.002"
+INSTALLER_VERSION="0.1.003"
 REPO_OWNER="GamingHubProject"
 REPO_NAME="GamingHub"
 REPO_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}"
@@ -173,13 +173,46 @@ require_existing_install() {
     info "Instance: ${GAMING_HUB_INSTANCE}"
 }
 
+# GitHub's /tags API sorts by tag NAME lexicographically, not by creation
+# date or version magnitude — confirmed live while migrating to the
+# X.Y.ZZZ.NN scheme: a deliberate renumbering means a new-scheme tag's
+# leading segments are numerically *smaller* than the old X.Y.Z scheme's
+# (e.g. v0.1.006.00 vs. the old v0.6.000), and the API's raw ordering put
+# the old scheme's tags first — silently resolving "latest" to a stale
+# version. A pure numeric/semver sort across *both* schemes can't fix this
+# either: the whole point of a renumbering is that old and new numbers
+# aren't meant to compare monotonically. What's actually true is that
+# every new-scheme tag was created after every old-scheme one (the
+# renumbering happens once; from here on only new-scheme tags get cut) —
+# so this prefers any 4-segment (new scheme) tag over every 3-segment (old
+# scheme) one, falling back to the old scheme only if no new-scheme tag
+# exists yet (e.g. an older copy of this script pointed at an old commit).
+# Within each group, `sort -V` (GNU version sort) correctly ranks
+# purely-numeric dot-separated tags — verified against the real mixed
+# tag list this migration produced, not assumed.
+latest_tag() {
+    local all_tags new_scheme old_scheme
+    all_tags="$(curl -fsSL --proto '=https' \
+        -H 'Accept: application/vnd.github+json' \
+        "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/tags?per_page=100" 2>/dev/null \
+        | grep -o '"name": *"[^"]*"' | sed -E 's/"name": *"//; s/"$//' || true)"
+
+    [[ -z "$all_tags" ]] && return 1
+
+    new_scheme="$(printf '%s\n' "$all_tags" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)"
+    if [[ -n "$new_scheme" ]]; then
+        printf '%s' "$new_scheme"
+        return 0
+    fi
+
+    old_scheme="$(printf '%s\n' "$all_tags" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)"
+    [[ -n "$old_scheme" ]] && printf '%s' "$old_scheme"
+}
+
 resolve_ref() {
     local choice="$1"
     if [[ "$choice" == "latest" ]]; then
-        LATEST_TAG="$(curl -fsSL --proto '=https' \
-            -H 'Accept: application/vnd.github+json' \
-            "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/tags" 2>/dev/null \
-            | grep -m1 '"name"' | sed -E 's/.*"name":\s*"([^"]+)".*/\1/' || true)"
+        LATEST_TAG="$(latest_tag)"
         if [[ -n "${LATEST_TAG:-}" ]]; then
             REF="$LATEST_TAG"
             REF_KIND="tags"
