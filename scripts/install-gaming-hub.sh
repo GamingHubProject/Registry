@@ -640,6 +640,7 @@ update_gaming_hub() {
 
     step "Downloading Gaming Hub ${REF}"
     download_and_extract "$REF" "$REF_KIND"
+    set_env_value .env APP_VERSION "${REF#v}"
 
     step "Building and starting Gaming Hub"
     build_and_start
@@ -891,6 +892,11 @@ set_env_value .env DB_PASSWORD "$DB_PASSWORD"
 # overwrites both this and SESSION_DOMAIN with that real domain.
 set_env_value .env SESSION_DOMAIN ""
 set_env_value .env SANCTUM_STATEFUL_DOMAINS "${ACCESS_HOST}:${APP_PORT}"
+# config('app.version'), read by Manager's VersionResolver to check an
+# extension's "requires: gaming-hub-platform" constraint — left unset,
+# it falls back to the literal string "dev", which isn't valid semver
+# and throws the moment any package manifest declares such a constraint.
+set_env_value .env APP_VERSION "${REF#v}"
 chmod 600 .env
 
 # ---------------------------------------------------------------------------
