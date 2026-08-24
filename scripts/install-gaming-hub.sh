@@ -39,6 +39,21 @@ info() { printf '\033[0;32m%s\033[0m\n' "$1"; }
 warn() { printf '\033[1;33m%s\033[0m\n' "$1"; }
 fail() { printf '\n\033[1;31mERROR: %s\033[0m\n' "$1" >&2; exit 1; }
 
+# Every prompt below reads from /dev/tty rather than stdin specifically
+# so `curl ... | bash` still works from a real interactive terminal (the
+# pipe consumes stdin, but /dev/tty is still the human's keyboard). That
+# same design means an unattended run — no controlling terminal at all
+# (an agent, cron, CI) — can't be detected by checking stdin; /dev/tty
+# itself has to be probed. Confirmed for real: opening it outright fails
+# ("No such device or address") in exactly that unattended case, so this
+# is computed once, up front, rather than re-checked per prompt.
+if exec 3<>/dev/tty 2>/dev/null; then
+    HAS_TTY=1
+    exec 3<&-
+else
+    HAS_TTY=0
+fi
+
 ask_default() {
     local prompt="$1" default_value="$2" answer
     read -r -p "${prompt} [${default_value}]: " answer </dev/tty
@@ -960,6 +975,8 @@ download_and_extract "$REF" "$REF_KIND"
 step "Writing configuration"
 # ---------------------------------------------------------------------------
 
+HAD_EXISTING_ENV=0
+[[ -f .env ]] && HAD_EXISTING_ENV=1
 [[ -f .env ]] || cp .env.example .env
 set_env_value .env GAMING_HUB_INSTANCE "$GAMING_HUB_INSTANCE"
 set_env_value .env APP_NAME "\"${APP_NAME}\""
@@ -987,7 +1004,23 @@ set_env_value .env DB_PASSWORD "$DB_PASSWORD"
 # sets it from a real DOMAIN instead). If configure_https runs later it
 # overwrites both this and SESSION_DOMAIN with that real domain.
 set_env_value .env SESSION_DOMAIN ""
-set_env_value .env SANCTUM_STATEFUL_DOMAINS "${ACCESS_HOST}:${APP_PORT}"
+
+EXISTING_SANCTUM_DOMAINS="$(get_env_value .env SANCTUM_STATEFUL_DOMAINS)"
+if [[ "$HAS_TTY" -eq 0 && "$HAD_EXISTING_ENV" -eq 1 && -n "$EXISTING_SANCTUM_DOMAINS" ]]; then
+    # Confirmed for real (three times) — an unattended reinstall/update
+    # (no /dev/tty, see HAS_TTY above) silently answers the ACCESS_HOST
+    # prompt with whatever APP_URL's host happens to be, which is *not*
+    # necessarily every domain SANCTUM_STATEFUL_DOMAINS has legitimately
+    # accumulated (e.g. a LAN IP added by hand, or by a prior interactive
+    # run, alongside "localhost"). Overwriting a real multi-value list
+    # with a single freshly-guessed one on every unattended run silently
+    # broke SPA login for anyone using the dropped domain. A fresh
+    # install (HAD_EXISTING_ENV=0, nothing to lose) still gets a real
+    # computed value below, same as an interactive run.
+    warn "No interactive terminal detected — keeping the existing SANCTUM_STATEFUL_DOMAINS (${EXISTING_SANCTUM_DOMAINS}) instead of overwriting it with a guessed ${ACCESS_HOST}:${APP_PORT}. Run this installer interactively (menu option 1) if that value actually needs to change."
+else
+    set_env_value .env SANCTUM_STATEFUL_DOMAINS "${ACCESS_HOST}:${APP_PORT}"
+fi
 # config('app.version'), read by Manager's VersionResolver to check an
 # extension's "requires: gaming-hub-platform" constraint — left unset,
 # it falls back to the literal string "dev", which isn't valid semver
